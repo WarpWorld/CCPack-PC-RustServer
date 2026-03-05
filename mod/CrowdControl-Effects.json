@@ -1,0 +1,1260 @@
+﻿[
+  {
+    "effectID": "give_airdrop_signal",
+    "price": 180,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_ammo_pistol",
+    "price": 70,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_ammo_pistol_hv",
+    "price": 95,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_ammo_pistol_incendiary",
+    "price": 120,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_ammo_rifle",
+    "price": 110,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_ammo_rifle_hv",
+    "price": 140,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_ammo_rifle_incendiary",
+    "price": 170,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_ammo_rockets",
+    "price": 220,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_ammo_shotgun_buckshot",
+    "price": 90,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_ammo_shotgun_incendiary",
+    "price": 135,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_ammo_shotgun_slug",
+    "price": 110,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_armor_kit",
+    "price": 180,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_bandage",
+    "price": 40,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_explosive_satchel",
+    "price": 320,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_explosive_timed",
+    "price": 650,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_fuel",
+    "price": 90,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_hazmat",
+    "price": 160,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_item_metal_fragments",
+    "price": 80,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_item_stone",
+    "price": 60,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_item_sulfur_ore",
+    "price": 90,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_item_wood",
+    "price": 60,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_large_medkit",
+    "price": 100,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_rock",
+    "price": 40,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_scrap_bonus",
+    "price": 100,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_sleeping_bag",
+    "price": 120,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_syringe",
+    "price": 70,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_torch",
+    "price": 40,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_weapon_ak",
+    "price": 350,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_weapon_grenade_beancan",
+    "price": 150,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_weapon_grenade_f1",
+    "price": 160,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_weapon_mgl",
+    "price": 420,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_weapon_pumpshotgun",
+    "price": 180,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_weapon_revolver",
+    "price": 120,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_weapon_rpg",
+    "price": 420,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "give_weapon_thompson",
+    "price": 220,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_admin_power_15s",
+    "price": 400,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": {
+      "value": "0:0:15.0"
+    },
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_bleed",
+    "price": 130,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_break_armor",
+    "price": 170,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_damage_over_time",
+    "price": 170,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": {
+      "value": "0:0:15.0"
+    },
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_drain_active_weapon_ammo",
+    "price": 120,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_drop_all",
+    "price": 320,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_drop_hotbar_item",
+    "price": 120,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_drop_item",
+    "price": 110,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_drop_some",
+    "price": 170,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_fill_hunger",
+    "price": 90,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_fire",
+    "price": 220,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_fly_mode_15s",
+    "price": 260,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": {
+      "value": "0:0:15.0"
+    },
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_fracture",
+    "price": 140,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_freeze_short",
+    "price": 150,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_full_heal",
+    "price": 120,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_god_mode_15s",
+    "price": 260,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": {
+      "value": "0:0:15.0"
+    },
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_handcuff",
+    "price": 180,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_heal",
+    "price": 70,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_heal_over_time",
+    "price": 170,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": {
+      "value": "0:0:15.0"
+    },
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_hunger_strike",
+    "price": 120,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_hurt",
+    "price": 80,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_kill",
+    "price": 300,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_reload_active_weapon",
+    "price": 90,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_remove_med_items",
+    "price": 130,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_revive",
+    "price": 260,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_scrap_tax",
+    "price": 110,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_strip_armor",
+    "price": 150,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_teleport_swap_cc_player",
+    "price": 180,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_teleport_to_cc_player",
+    "price": 160,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_teleport_to_sleeping_bag",
+    "price": 220,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "player_unload_ammo",
+    "price": 110,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_attack_helicopter",
+    "price": 500,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_bear",
+    "price": 220,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_boar",
+    "price": 160,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_chicken",
+    "price": 100,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_minicopter",
+    "price": 250,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_motorbike",
+    "price": 220,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_nodes",
+    "price": 260,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_nodes_metal",
+    "price": 280,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_nodes_stone",
+    "price": 240,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_nodes_sulfur",
+    "price": 320,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_pedalbike",
+    "price": 190,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_rhib",
+    "price": 320,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_rowboat",
+    "price": 260,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_scarecrow",
+    "price": 200,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_scarecrows",
+    "price": 350,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_scientistnpc",
+    "price": 260,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_scraptransporthelicopter",
+    "price": 500,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_simpleshark",
+    "price": 260,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_sleeping_bag_here",
+    "price": 180,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_stag",
+    "price": 150,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_supply_drop",
+    "price": 240,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_testridablehorse",
+    "price": 180,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_vehicle_car_large",
+    "price": 380,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_vehicle_car_small",
+    "price": 320,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_vehicle_truck",
+    "price": 380,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_wolf",
+    "price": 170,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "spawn_wolves",
+    "price": 260,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "test_hype_train",
+    "price": 25,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "world_set_day",
+    "price": 140,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  },
+  {
+    "effectID": "world_set_night",
+    "price": 140,
+    "sessionCooldown": 0,
+    "userCooldown": 0,
+    "duration": null,
+    "inactive": false,
+    "scale": {
+      "percent": 1.0,
+      "duration": 1.0,
+      "inactive": true
+    }
+  }
+]
