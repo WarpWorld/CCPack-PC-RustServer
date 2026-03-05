@@ -457,6 +457,12 @@ namespace Oxide.Plugins
             {
                 return;
             }
+
+            if (IsPlayerAllowedForCrowdControl(player))
+            {
+                player.ChatMessage("Rust Crowd Control support is available. Open your console (F1) and type crowdcontrol for next steps.");
+            }
+
             FireAndForget(UpdateTeleportAvailabilityAsync(), "teleport availability on connect");
         }
 
@@ -514,6 +520,29 @@ namespace Oxide.Plugins
             HandleCrowdControlCommand(player, args);
         }
 
+        [ConsoleCommand("cc")]
+        private void ConsoleCommandCrowdControlShort(ConsoleSystem.Arg arg)
+        {
+            HandleCrowdControlConsoleCommand(arg);
+        }
+
+        [ConsoleCommand("crowdcontrol")]
+        private void ConsoleCommandCrowdControlLong(ConsoleSystem.Arg arg)
+        {
+            HandleCrowdControlConsoleCommand(arg);
+        }
+
+        private void HandleCrowdControlConsoleCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg?.Player();
+            if (player == null)
+            {
+                return;
+            }
+
+            HandleCrowdControlCommand(player, arg.Args ?? Array.Empty<string>());
+        }
+
         private void HandleCrowdControlCommand(BasePlayer player, string[] args)
         {
             if (player == null)
@@ -562,6 +591,7 @@ namespace Oxide.Plugins
             player.ConsoleMessage("[CrowdControl] /crowdcontrol unlink - Unlink your Crowd Control account");
             player.ConsoleMessage("[CrowdControl] /crowdcontrol status - Show auth/session status");
             player.ConsoleMessage("[CrowdControl] /crowdcontrol restart - Restart game session using saved token");
+            player.ConsoleMessage("[CrowdControl] Console usage: crowdcontrol <link|unlink|status|restart>");
             player.ConsoleMessage("[CrowdControl] Alias: /cc <same_subcommand>");
             ShowEffectUi(player, "Crowd Control", "Help sent to F1 console.");
         }
@@ -891,14 +921,28 @@ namespace Oxide.Plugins
                 return false;
             }
 
-            var allowAllUsers = _config?.AllowAllUsersWithoutPermission == true;
-            if (!allowAllUsers && !permission.UserHasPermission(player.UserIDString, PermUse) && !player.IsAdmin)
+            if (!IsPlayerAllowedForCrowdControl(player))
             {
                 ShowEffectUi(player, "Crowd Control", "You do not have permission to use Crowd Control.");
                 return false;
             }
 
             return true;
+        }
+
+        private bool IsPlayerAllowedForCrowdControl(BasePlayer player)
+        {
+            if (player == null)
+            {
+                return false;
+            }
+
+            if (_config?.AllowAllUsersWithoutPermission == true)
+            {
+                return true;
+            }
+
+            return player.IsAdmin || permission.UserHasPermission(player.UserIDString, PermUse);
         }
 
         #endregion
