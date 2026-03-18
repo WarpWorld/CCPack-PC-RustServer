@@ -27,7 +27,7 @@
       "world_set_day": { "name": "Set Day", "description": "Set world time to day.", "category": [], "price": 140 },
       "world_set_night": { "name": "Set Night", "description": "Set world time to night.", "category": [], "price": 140 },
       "player_hurt": { "name": "Player Hurt", "description": "Deal light damage to the player.", "category": [], "price": 80 },
-      "player_handcuff": { "name": "Handcuff Player", "description": "Immobilize the player briefly.", "category": [], "price": 180 },
+      "player_handcuff": { "name": "Handcuff Player", "description": "Immobilize the player briefly.", "category": [], "price": 180, "duration": { "value": "0:0:12.0" } },
       "player_fire": { "name": "Player Fire", "description": "Set the player on fire briefly.", "category": [], "price": 220 },
       "player_heal": { "name": "Player Heal", "description": "Heal a small amount.", "category": [], "price": 70 },
       "player_drop_item": { "name": "Player Drop Item", "description": "Drop active inventory item.", "category": [], "price": 110 },
