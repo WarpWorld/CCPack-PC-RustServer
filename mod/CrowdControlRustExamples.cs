@@ -69,11 +69,13 @@ namespace Oxide.Plugins
                 }
             };
 
-            var ok = CrowdControl.Call("CC_RegisterEffects", ProviderName, effects) as bool?;
-            Puts($"Example effect registration result: {(ok == true ? "success" : "failed")}.");
+            var registerResult = CrowdControl.Call("CC_RegisterEffects", ProviderName, effects);
+            var ok = registerResult is bool registered && registered;
+            Puts($"Example effect registration result: {(ok ? "success" : "failed")}.");
         }
 
         // Hook called by CrowdControlRust for registered external effects.
+        [HookMethod("OnCrowdControlEffect")]
         private object OnCrowdControlEffect(JObject context)
         {
             var effectId = (context?.Value<string>("effectID") ?? string.Empty).Trim().ToLowerInvariant();

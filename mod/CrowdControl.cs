@@ -1,0 +1,3984 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.WebSockets;
+using System.Reflection;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using Oxide.Core;
+using Oxide.Core.Plugins;
+using UnityEngine;
+
+namespace Oxide.Plugins
+{
+    [Info("CrowdControl", "jaku", "0.1.1")]
+    [Description("Crowd Control integration for Rust with auth, PubSub, and permission-based access controls.")]
+    public class CrowdControl : RustPlugin
+    {
+        private const string PermUse = "crowdcontrol.use";
+        private const string PermAdmin = "crowdcontrol.admin";
+        private const bool StopSessionOnDisconnect = true;
+        private const int SocketKeepAliveMinutes = 5;
+        private const bool StopSessionOnUnload = true;
+        private const bool AutoStartSessionAfterAuth = true;
+        private const float ReconnectDelaySeconds = 5f;
+        private const int MaxAuthQueue = 50;
+        private const string GamePackId = "RustServer";
+        private const string PubSubWebSocketUrl = "wss://pubsub.crowdcontrol.live";
+        private const string OpenApiUrl = "https://openapi.crowdcontrol.live";
+        private const string UserAgent = "CrowdControl/0.1.0";
+        private const bool VerboseLogging = true;
+        private const int CustomEffectsPerOperation = 20;
+        private const string EffectPricingFileName = "CrowdControl-Effects.json";
+        private const float ExternalEffectPendingTimeoutSeconds = 15f;
+        private const string ExternalEffectHookName = "OnCrowdControlEffect";
+        private const string BuiltInEffectsPluginName = "CrowdControlEffects";
+        private static readonly List<string> Scopes = new List<string>
+        {
+            "profile:read",
+            "session:write",
+            "session:control",
+            "custom-effects:read",
+            "custom-effects:write",
+            "default-effect:write",
+            "instance:write"
+        };
+        private static readonly List<string> Packs = new List<string> { "RustServer" };
+
+        private PluginConfig _config;
+        private StoredData _data;
+
+        private readonly object _socketSync = new object();
+        private readonly SemaphoreSlim _sendSemaphore = new SemaphoreSlim(1, 1);
+        private readonly Queue<string> _pendingAuthRequests = new Queue<string>();
+        private readonly Dictionary<string, string> _authCodeToSteamId = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _sessionStartInProgress = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, DateTime> _lastCustomEffectsSyncUtc = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, DateTime> _recentHandledRequestIds = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, EffectRetryState> _activeEffectRetries = new Dictionary<string, EffectRetryState>(StringComparer.OrdinalIgnoreCase);
+        private readonly object _requestIdSync = new object();
+        private readonly object _externalEffectsSync = new object();
+        private readonly Dictionary<string, ExternalEffectDefinition> _externalEffectsById = new Dictionary<string, ExternalEffectDefinition>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, HashSet<string>> _externalEffectIdsByProvider = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, ExternalEffectPendingRequest> _externalPendingRequests = new Dictionary<string, ExternalEffectPendingRequest>(StringComparer.OrdinalIgnoreCase);
+
+        private ClientWebSocket _socket;
+        private CancellationTokenSource _socketCts;
+        private Oxide.Plugins.Timer _reconnectTimer;
+        private Oxide.Plugins.Timer _heartbeatTimer;
+        private bool _isSocketConnecting;
+        private volatile bool _isUnloading;
+        private DateTime _lastSocketConnectUtc = DateTime.MinValue;
+        private DateTime _lastSessionDisconnectToastUtc = DateTime.MinValue;
+
+        #region Models
+
+        private sealed class PluginConfig
+        {
+            // Default IDs, you can get unique ones for your own server is you wish. Reach out to support@crowdcontrol.live for more info.
+            [JsonProperty("app_id")]
+            public string AppId { get; set; } = "ccaid-01kjfx91h9cf0mqa7j2z3tjmwx";
+
+            [JsonProperty("app_secret")]
+            public string AppSecret { get; set; } = "b9b187f3026b70aad6017dbe41a62445811acc4bb2d3b4c092e445b11ee72fa3";
+
+            [JsonProperty("allow_all_users_without_permission")]
+            public bool AllowAllUsersWithoutPermission { get; set; } = true;
+
+            [JsonProperty("session_rules")]
+            public SessionRulesConfig SessionRules { get; set; } = new SessionRulesConfig();
+
+            [JsonProperty("retry_policy")]
+            public RetryPolicyConfig RetryPolicy { get; set; } = new RetryPolicyConfig();
+        }
+
+        private sealed class SessionRulesConfig
+        {
+            [JsonProperty("enable_integration_triggers")]
+            public bool EnableIntegrationTriggers { get; set; } = true;
+
+            [JsonProperty("enable_price_change")]
+            public bool EnablePriceChange { get; set; } = true;
+
+            [JsonProperty("disable_test_effects")]
+            public bool DisableTestEffects { get; set; } = false;
+
+            [JsonProperty("disable_custom_effects_sync")]
+            public bool DisableCustomEffectsSync { get; set; } = false;
+        }
+
+        private sealed class RetryPolicyConfig
+        {
+            [JsonProperty("enabled")]
+            public bool Enabled { get; set; } = true;
+
+            [JsonProperty("default")]
+            public RetrySourcePolicyConfig Default { get; set; } = new RetrySourcePolicyConfig
+            {
+                MaxAttempts = 25,
+                MaxDurationSeconds = 60,
+                RetryIntervalSeconds = 2.4f
+            };
+
+            [JsonProperty("twitch")]
+            public RetrySourcePolicyConfig Twitch { get; set; } = new RetrySourcePolicyConfig
+            {
+                MaxAttempts = 25,
+                MaxDurationSeconds = 60,
+                RetryIntervalSeconds = 2.4f
+            };
+
+            [JsonProperty("tiktok")]
+            public RetrySourcePolicyConfig Tiktok { get; set; } = new RetrySourcePolicyConfig
+            {
+                MaxAttempts = 250,
+                MaxDurationSeconds = 300,
+                RetryIntervalSeconds = 1.2f
+            };
+        }
+
+        private sealed class RetrySourcePolicyConfig
+        {
+            [JsonProperty("max_attempts")]
+            public int MaxAttempts { get; set; } = 25;
+
+            [JsonProperty("max_duration_seconds")]
+            public int MaxDurationSeconds { get; set; } = 60;
+
+            [JsonProperty("retry_interval_seconds")]
+            public float RetryIntervalSeconds { get; set; } = 2.4f;
+        }
+
+        private sealed class EffectPricingScaleConfig
+        {
+            [JsonProperty("percent")]
+            public float Percent { get; set; } = 1f;
+
+            [JsonProperty("duration")]
+            public float Duration { get; set; } = 1f;
+
+            [JsonProperty("inactive")]
+            public bool Inactive { get; set; } = true;
+        }
+
+        private sealed class EffectPricingEntry
+        {
+            [JsonProperty("effectID")]
+            public string EffectId { get; set; }
+
+            [JsonProperty("price")]
+            public int Price { get; set; }
+
+            [JsonProperty("sessionCooldown")]
+            public int SessionCooldown { get; set; }
+
+            [JsonProperty("userCooldown")]
+            public int UserCooldown { get; set; }
+
+            [JsonProperty("duration")]
+            public JObject Duration { get; set; }
+
+            [JsonProperty("inactive")]
+            public bool Inactive { get; set; } = false;
+
+            [JsonProperty("scale")]
+            public EffectPricingScaleConfig Scale { get; set; } = new EffectPricingScaleConfig();
+        }
+
+        private sealed class ExternalEffectDefinition
+        {
+            public string ProviderName;
+            public string EffectId;
+            public JObject MenuEffect;
+            public bool SyncMenu = true;
+        }
+
+        private sealed class ExternalEffectPendingRequest
+        {
+            public string RequestId;
+            public string EffectId;
+            public string ProviderName;
+            public string SteamId;
+            public string Token;
+            public Oxide.Plugins.Timer TimeoutTimer;
+        }
+
+        private sealed class StoredData
+        {
+            [JsonProperty("player_sessions")]
+            public Dictionary<string, PlayerSessionState> PlayerSessions { get; set; } = new Dictionary<string, PlayerSessionState>();
+
+            [JsonProperty("session_rules_signature")]
+            public string SessionRulesSignature { get; set; } = string.Empty;
+
+            [JsonProperty("application_instance_id")]
+            public string ApplicationInstanceId { get; set; } = string.Empty;
+
+            [JsonProperty("application_instance_app_id")]
+            public string ApplicationInstanceAppId { get; set; } = string.Empty;
+        }
+
+        private sealed class PlayerSessionState
+        {
+            [JsonProperty("steam_id")]
+            public string SteamId { get; set; }
+
+            [JsonProperty("token")]
+            public string Token { get; set; }
+
+            [JsonProperty("ccuid")]
+            public string CcUid { get; set; }
+
+            [JsonProperty("origin_id")]
+            public string OriginId { get; set; }
+
+            [JsonProperty("profile_type")]
+            public string ProfileType { get; set; }
+
+            [JsonProperty("display_name")]
+            public string DisplayName { get; set; }
+
+            [JsonProperty("token_expiry_unix")]
+            public long TokenExpiryUnix { get; set; }
+
+            [JsonProperty("game_session_id")]
+            public string GameSessionId { get; set; }
+
+            [JsonProperty("authenticated_at_unix")]
+            public long AuthenticatedAtUnix { get; set; }
+        }
+
+        private sealed class EffectRetryState
+        {
+            public string RequestId;
+            public string EffectId;
+            public string SteamId;
+            public string Token;
+            public JObject Payload;
+            public JObject Effect;
+            public int DurationSeconds;
+            public string SourceType;
+            public int AttemptsMade;
+            public int MaxAttempts;
+            public TimeSpan MaxDuration;
+            public float RetryIntervalSeconds;
+            public DateTime FirstFailureUtc;
+            public string LastError;
+            public Oxide.Plugins.Timer RetryTimer;
+        }
+
+        private sealed class DecodedJwt
+        {
+            public string CcUid;
+            public string OriginId;
+            public string ProfileType;
+            public string Name;
+            public long Exp;
+            public string ScopeSummary;
+        }
+
+        #endregion
+
+        #region Oxide Lifecycle
+
+        private void Init()
+        {
+            _isUnloading = false;
+            permission.RegisterPermission(PermUse, this);
+            permission.RegisterPermission(PermAdmin, this);
+            _data = Interface.Oxide.DataFileSystem.ReadObject<StoredData>(Name) ?? new StoredData();
+            Puts("CrowdControl initialized.");
+        }
+
+        private void OnServerInitialized()
+        {
+            ValidateConfig();
+            SaveConfig();
+            LoadOrSeedEffectPricingEntries();
+            FireAndForget(RefreshSessionsAfterReloadAsync(), "refresh sessions after reload");
+            FireAndForget(ApplySessionRulesAsync(), "apply session rules");
+            FireAndForget(EnsureSocketConnectedAsync(), "initial socket connect");
+            StartSocketHeartbeat();
+            WarnIfBuiltInEffectsPluginMissing("server initialization", null, false);
+            NotifyCrowdControlProvidersSessionStateChanged();
+        }
+
+        private void Unload()
+        {
+            _isUnloading = true;
+
+            if (_config != null && StopSessionOnUnload)
+            {
+                foreach (var kvp in _data.PlayerSessions)
+                {
+                    var session = kvp.Value;
+                    if (!string.IsNullOrEmpty(session?.Token))
+                    {
+                        FireAndForget(StopGameSessionAsync(session), "stop game session on unload");
+                    }
+                }
+            }
+
+            foreach (var kvp in _activeEffectRetries)
+            {
+                kvp.Value?.RetryTimer?.Destroy();
+            }
+            _activeEffectRetries.Clear();
+
+            lock (_externalEffectsSync)
+            {
+                foreach (var kvp in _externalPendingRequests)
+                {
+                    kvp.Value?.TimeoutTimer?.Destroy();
+                }
+                _externalPendingRequests.Clear();
+                _externalEffectsById.Clear();
+                _externalEffectIdsByProvider.Clear();
+            }
+
+            _reconnectTimer?.Destroy();
+            _reconnectTimer = null;
+            _heartbeatTimer?.Destroy();
+            _heartbeatTimer = null;
+
+            _socketCts?.Cancel();
+            _socket?.Abort();
+            _socket?.Dispose();
+            _socket = null;
+            _socketCts = null;
+
+            SaveData();
+        }
+
+        private void OnServerSave()
+        {
+            SaveData();
+        }
+
+        private void OnPlayerDisconnected(BasePlayer player, string reason)
+        {
+            if (player == null)
+            {
+                return;
+            }
+
+            if (StopSessionOnDisconnect &&
+                _data.PlayerSessions.TryGetValue(player.UserIDString, out var session) &&
+                !string.IsNullOrEmpty(session?.Token))
+            {
+                FireAndForget(StopGameSessionAsync(session, player.UserIDString), "stop session on disconnect");
+            }
+
+            FireAndForget(EnsureSocketConnectedAsync(), "socket state check on disconnect");
+            NotifyCrowdControlProvidersSessionStateChanged();
+        }
+
+        private void OnPlayerConnected(BasePlayer player)
+        {
+            if (player == null)
+            {
+                return;
+            }
+
+            if (IsPlayerAllowedForCrowdControl(player))
+            {
+                player.ChatMessage("Rust Crowd Control support is available. Open your console (F1) and type crowdcontrol for next steps.");
+            }
+
+            FireAndForget(EnsureSocketConnectedAsync(), "socket state check on connect");
+            if (_data.PlayerSessions.TryGetValue(player.UserIDString, out var session) &&
+                session != null &&
+                !string.IsNullOrEmpty(session.Token) &&
+                string.IsNullOrEmpty(session.GameSessionId))
+            {
+                FireAndForget(RestartGameSessionAsync(session, player.UserIDString), "start session on connect");
+            }
+
+            NotifyCrowdControlProvidersSessionStateChanged();
+        }
+
+        private void OnPluginLoaded(Plugin plugin)
+        {
+            if (plugin == null || string.IsNullOrWhiteSpace(plugin.Name))
+            {
+                return;
+            }
+
+            if (string.Equals(plugin.Name, BuiltInEffectsPluginName, StringComparison.OrdinalIgnoreCase))
+            {
+                Puts("CrowdControlEffects loaded; built-in effect provider is now available.");
+                NotifyCrowdControlProvidersSessionStateChanged();
+            }
+        }
+
+        private void OnPluginUnloaded(Plugin plugin)
+        {
+            if (plugin == null || string.IsNullOrWhiteSpace(plugin.Name))
+            {
+                return;
+            }
+
+            CC_UnregisterEffects(plugin.Name);
+            if (string.Equals(plugin.Name, BuiltInEffectsPluginName, StringComparison.OrdinalIgnoreCase))
+            {
+                PrintWarning("CrowdControlEffects unloaded; built-in effects will be unavailable until it is loaded again.");
+            }
+        }
+
+        #endregion
+
+        #region Commands
+
+        [ChatCommand("cc")]
+        private void CommandCrowdControl(BasePlayer player, string command, string[] args)
+        {
+            HandleCrowdControlCommand(player, args);
+        }
+
+        [ChatCommand("crowdcontrol")]
+        private void CommandCrowdControlLong(BasePlayer player, string command, string[] args)
+        {
+            HandleCrowdControlCommand(player, args);
+        }
+
+        [ConsoleCommand("cc")]
+        private void ConsoleCommandCrowdControlShort(ConsoleSystem.Arg arg)
+        {
+            HandleCrowdControlConsoleCommand(arg);
+        }
+
+        [ConsoleCommand("crowdcontrol")]
+        private void ConsoleCommandCrowdControlLong(ConsoleSystem.Arg arg)
+        {
+            HandleCrowdControlConsoleCommand(arg);
+        }
+
+        private void HandleCrowdControlConsoleCommand(ConsoleSystem.Arg arg)
+        {
+            var player = arg?.Player();
+            if (player == null)
+            {
+                return;
+            }
+
+            HandleCrowdControlCommand(player, arg.Args ?? Array.Empty<string>());
+        }
+
+        private void HandleCrowdControlCommand(BasePlayer player, string[] args)
+        {
+            if (player == null)
+            {
+                return;
+            }
+
+            if (args.Length == 0)
+            {
+                SendHelp(player);
+                return;
+            }
+
+            var sub = args[0].ToLowerInvariant();
+            switch (sub)
+            {
+                case "help":
+                    SendHelp(player);
+                    break;
+                case "link":
+                case "auth":
+                    HandleAuthCommand(player);
+                    break;
+                case "unlink":
+                    HandleLogoutCommand(player);
+                    break;
+                case "status":
+                    HandleStatusCommand(player);
+                    break;
+                case "settings":
+                    HandleSettingsCommand(player);
+                    break;
+                case "reload":
+                    HandleReloadCommand(player);
+                    break;
+                case "restart":
+                    HandleRestartSessionCommand(player);
+                    break;
+                case "logout":
+                    HandleLogoutCommand(player);
+                    break;
+                default:
+                    SendHelp(player);
+                    break;
+            }
+        }
+
+        private void SendHelp(BasePlayer player)
+        {
+            player.ConsoleMessage("[CrowdControl] Commands:");
+            player.ConsoleMessage("[CrowdControl] /crowdcontrol link - Link your Crowd Control account");
+            player.ConsoleMessage("[CrowdControl] /crowdcontrol unlink - Unlink your Crowd Control account");
+            player.ConsoleMessage("[CrowdControl] /crowdcontrol status - Show auth/session status");
+            player.ConsoleMessage("[CrowdControl] /crowdcontrol settings - Show current server Crowd Control settings");
+            player.ConsoleMessage($"[CrowdControl] /crowdcontrol reload - Reload Crowd Control config/data and refresh sessions ({PermAdmin})");
+            player.ConsoleMessage("[CrowdControl] /crowdcontrol restart - Restart game session using saved token");
+            player.ConsoleMessage("[CrowdControl] Console usage: crowdcontrol <link|unlink|status|settings|restart|reload>");
+            player.ConsoleMessage("[CrowdControl] Alias: /cc <same_subcommand>");
+            ShowEffectUi(player, "Crowd Control", "Help sent to F1 console.");
+        }
+
+        private void HandleAuthCommand(BasePlayer player)
+        {
+            if (!CanUsePlugin(player))
+            {
+                return;
+            }
+
+            if (_data.PlayerSessions.TryGetValue(player.UserIDString, out var existingSession) &&
+                !string.IsNullOrEmpty(existingSession?.Token))
+            {
+                ShowEffectUi(player, "Crowd Control", "You are already authenticated. Use /cc status, /cc restart, or /cc unlink first.");
+                return;
+            }
+
+            lock (_pendingAuthRequests)
+            {
+                if (_pendingAuthRequests.Contains(player.UserIDString))
+                {
+                    ShowEffectUi(player, "Crowd Control", "An auth code request is already pending for you. Check console (F1).");
+                    return;
+                }
+            }
+
+            if (_pendingAuthRequests.Count >= MaxAuthQueue)
+            {
+                ShowEffectUi(player, "Crowd Control", "Auth queue is currently full. Try again shortly.");
+                return;
+            }
+
+            lock (_pendingAuthRequests)
+            {
+                _pendingAuthRequests.Enqueue(player.UserIDString);
+            }
+
+            FireAndForget(EnsureSocketConnectedAsync(), "auth command socket ensure");
+            FireAndForget(SendGenerateAuthCodeAsync(), "send generate auth code");
+            ShowEffectUi(player, "Crowd Control", "Check console (F1) for instructions.");
+        }
+
+        private void HandleStatusCommand(BasePlayer player)
+        {
+            if (!CanUsePlugin(player))
+            {
+                return;
+            }
+
+            if (!_data.PlayerSessions.TryGetValue(player.UserIDString, out var session) || string.IsNullOrEmpty(session.Token))
+            {
+                ShowEffectUi(player, "Crowd Control", "No Crowd Control session found. Run /cc link to connect.");
+                return;
+            }
+
+            var expires = DateTimeOffset.FromUnixTimeSeconds(session.TokenExpiryUnix).UtcDateTime;
+            ShowEffectUi(player, "Crowd Control", $"Authenticated as {session.DisplayName} ({session.CcUid}).");
+            ShowEffectUi(player, "Crowd Control", $"Token expires (UTC): {expires:O}");
+            ShowEffectUi(player, "Crowd Control", $"Game Session ID: {(string.IsNullOrEmpty(session.GameSessionId) ? "none" : session.GameSessionId)}");
+        }
+
+        private void HandleSettingsCommand(BasePlayer player)
+        {
+            if (!CanUsePlugin(player))
+            {
+                return;
+            }
+
+            var rules = _config?.SessionRules ?? new SessionRulesConfig();
+            var retry = _config?.RetryPolicy ?? new RetryPolicyConfig();
+            var retryDefault = retry.Default ?? new RetrySourcePolicyConfig();
+            var retryTwitch = retry.Twitch ?? retryDefault;
+            var retryTiktok = retry.Tiktok ?? retryDefault;
+
+            player.ConsoleMessage("[CrowdControl] Active server settings:");
+            player.ConsoleMessage($"[CrowdControl] Access: {(_config?.AllowAllUsersWithoutPermission ?? true ? "all players may use Crowd Control" : $"permission required ({PermUse})")}");
+            player.ConsoleMessage($"[CrowdControl] Session rules: integration triggers={(rules.EnableIntegrationTriggers ? "enabled" : "disabled")}, price changes={(rules.EnablePriceChange ? "enabled" : "disabled")}, test effects={(rules.DisableTestEffects ? "disabled" : "enabled")}, custom effect sync={(rules.DisableCustomEffectsSync ? "disabled" : "enabled")}");
+            player.ConsoleMessage($"[CrowdControl] Retry policy: {(retry.Enabled ? "enabled" : "disabled")}");
+            player.ConsoleMessage($"[CrowdControl] Retry default: attempts={retryDefault.MaxAttempts}, duration={retryDefault.MaxDurationSeconds}s, interval={retryDefault.RetryIntervalSeconds:0.##}s");
+            player.ConsoleMessage($"[CrowdControl] Retry Twitch: attempts={retryTwitch.MaxAttempts}, duration={retryTwitch.MaxDurationSeconds}s, interval={retryTwitch.RetryIntervalSeconds:0.##}s");
+            player.ConsoleMessage($"[CrowdControl] Retry TikTok: attempts={retryTiktok.MaxAttempts}, duration={retryTiktok.MaxDurationSeconds}s, interval={retryTiktok.RetryIntervalSeconds:0.##}s");
+            ShowEffectUi(player, "Crowd Control", "Server settings sent to F1 console.");
+        }
+
+        private void HandleReloadCommand(BasePlayer player)
+        {
+            if (!CanUseAdminCommand(player))
+            {
+                return;
+            }
+
+            LoadConfig();
+            ValidateConfig();
+            SaveConfig();
+            _data = Interface.Oxide.DataFileSystem.ReadObject<StoredData>(Name) ?? new StoredData();
+            LoadOrSeedEffectPricingEntries();
+            FireAndForget(RefreshSessionsAfterReloadAsync(), "admin reload refresh sessions");
+            FireAndForget(ApplySessionRulesAsync(), "admin reload apply session rules");
+            FireAndForget(EnsureSocketConnectedAsync(), "admin reload socket ensure");
+            NotifyCrowdControlProvidersSessionStateChanged();
+            ShowEffectUi(player, "Crowd Control", "Reloaded config/data and refreshing Crowd Control sessions.");
+        }
+
+        private void HandleRestartSessionCommand(BasePlayer player)
+        {
+            if (!CanUsePlugin(player))
+            {
+                return;
+            }
+
+            if (!_data.PlayerSessions.TryGetValue(player.UserIDString, out var session) || string.IsNullOrEmpty(session?.Token))
+            {
+                ShowEffectUi(player, "Crowd Control", "No saved Crowd Control token. Run /cc link first.");
+                return;
+            }
+
+            FireAndForget(RestartGameSessionAsync(session, player.UserIDString), "manual session restart");
+            ShowEffectUi(player, "Crowd Control", "Restarting Crowd Control session...");
+        }
+
+        private void HandleLogoutCommand(BasePlayer player)
+        {
+            if (!CanUsePlugin(player))
+            {
+                return;
+            }
+
+            if (!_data.PlayerSessions.TryGetValue(player.UserIDString, out var session))
+            {
+                ShowEffectUi(player, "Crowd Control", "No active auth state to clear.");
+                return;
+            }
+
+            FireAndForget(StopGameSessionAsync(session), "logout stop session");
+            _data.PlayerSessions.Remove(player.UserIDString);
+            SaveData();
+            FireAndForget(EnsureSocketConnectedAsync(), "socket state check on logout");
+            ShowEffectUi(player, "Crowd Control", "Crowd Control credentials removed.");
+        }
+
+        #endregion
+
+        #region External Effect API
+
+        [HookMethod("CC_RegisterEffects")]
+        public object CC_RegisterEffects(string providerName, object effectsPayload)
+        {
+            return RegisterEffectsInternal(providerName, effectsPayload, localOnly: false);
+        }
+
+        [HookMethod("CC_RegisterLocalEffects")]
+        public object CC_RegisterLocalEffects(string providerName, object effectsPayload)
+        {
+            return RegisterEffectsInternal(providerName, effectsPayload, localOnly: true);
+        }
+
+        [HookMethod("CC_UnregisterEffects")]
+        public object CC_UnregisterEffects(string providerName)
+        {
+            if (string.IsNullOrWhiteSpace(providerName))
+            {
+                return false;
+            }
+
+            var normalizedProvider = providerName.Trim();
+            var removed = 0;
+            lock (_externalEffectsSync)
+            {
+                if (!_externalEffectIdsByProvider.TryGetValue(normalizedProvider, out var ids))
+                {
+                    return false;
+                }
+
+                foreach (var effectId in ids)
+                {
+                    if (_externalEffectsById.Remove(effectId))
+                    {
+                        removed++;
+                    }
+                }
+
+                _externalEffectIdsByProvider.Remove(normalizedProvider);
+            }
+
+            LogVerbose($"Unregistered {removed} external effect(s) from provider={normalizedProvider}.");
+            if (removed > 0)
+            {
+                FireAndForget(SyncCustomEffectsForAllSessionsAsync(), "external effects unregister sync");
+            }
+            return removed > 0;
+        }
+
+        private bool RegisterEffectsInternal(string providerName, object effectsPayload, bool localOnly)
+        {
+            if (string.IsNullOrWhiteSpace(providerName))
+            {
+                return false;
+            }
+
+            var parsed = ParseExternalEffectsPayload(effectsPayload);
+            if (parsed == null || parsed.Count == 0)
+            {
+                return false;
+            }
+
+            var normalizedProvider = providerName.Trim();
+            var registered = 0;
+            var registeredMenuEffects = 0;
+            lock (_externalEffectsSync)
+            {
+                if (!_externalEffectIdsByProvider.TryGetValue(normalizedProvider, out var providerEffectIds))
+                {
+                    providerEffectIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    _externalEffectIdsByProvider[normalizedProvider] = providerEffectIds;
+                }
+
+                for (var i = 0; i < parsed.Count; i++)
+                {
+                    var item = parsed[i];
+                    var effectId = item.Value<string>("effectID");
+                    if (string.IsNullOrWhiteSpace(effectId))
+                    {
+                        continue;
+                    }
+
+                    effectId = NormalizeEffectId(effectId);
+                    var syncMenu = !localOnly && item.Value<bool?>("syncMenu") != false;
+                    var menuObj = new JObject
+                    {
+                        ["name"] = item.Value<string>("name") ?? effectId,
+                        ["description"] = item.Value<string>("description") ?? "External effect.",
+                        ["price"] = Math.Max(0, item.Value<int?>("price") ?? 0)
+                    };
+
+                    var duration = item["duration"] as JObject;
+                    if (duration != null)
+                    {
+                        menuObj["duration"] = (JObject)duration.DeepClone();
+                    }
+
+                    _externalEffectsById[effectId] = new ExternalEffectDefinition
+                    {
+                        ProviderName = normalizedProvider,
+                        EffectId = effectId,
+                        MenuEffect = menuObj,
+                        SyncMenu = syncMenu
+                    };
+                    providerEffectIds.Add(effectId);
+                    registered++;
+                    if (syncMenu)
+                    {
+                        registeredMenuEffects++;
+                    }
+                }
+            }
+
+            if (registered <= 0)
+            {
+                return false;
+            }
+
+            LogVerbose(
+                $"Registered {registered} {(localOnly ? "local-only" : "external")} effect(s) from provider={normalizedProvider}.");
+            if (registeredMenuEffects > 0)
+            {
+                FireAndForget(SyncCustomEffectsForAllSessionsAsync(), "external effects register sync");
+            }
+
+            return true;
+        }
+
+        [HookMethod("CC_CompleteEffect")]
+        public object CC_CompleteEffect(string requestId, string status = "success", string reason = "", string playerMessage = "")
+        {
+            return CC_SendEffectResponse(requestId, status, reason, playerMessage, null);
+        }
+
+        [HookMethod("CC_GetActiveCcPlayerSteamIds")]
+        public object CC_GetActiveCcPlayerSteamIds(string excludeSteamId = "")
+        {
+            var results = new JArray();
+            foreach (var kvp in _data.PlayerSessions)
+            {
+                if (!string.IsNullOrWhiteSpace(excludeSteamId) &&
+                    string.Equals(kvp.Key, excludeSteamId, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var session = kvp.Value;
+                if (session == null || string.IsNullOrEmpty(session.Token) || string.IsNullOrEmpty(session.GameSessionId))
+                {
+                    continue;
+                }
+
+                if (!IsSteamPlayerOnline(kvp.Key))
+                {
+                    continue;
+                }
+
+                results.Add(kvp.Key);
+            }
+
+            return results;
+        }
+
+        [HookMethod("CC_ReportEffectAvailability")]
+        public object CC_ReportEffectAvailability(object effectIdsPayload, string status)
+        {
+            var effectIds = ParseEffectIdsPayload(effectIdsPayload);
+            if (effectIds.Count == 0 || string.IsNullOrWhiteSpace(status))
+            {
+                return false;
+            }
+
+            FireAndForget(ReportEffectAvailabilityAsync(effectIds, status.Trim()), "report effect availability");
+            return true;
+        }
+
+        [HookMethod("CC_SendEffectResponse")]
+        public object CC_SendEffectResponse(string requestId, string status, string reason = "", string playerMessage = "", object timeRemainingMs = null)
+        {
+            if (string.IsNullOrWhiteSpace(requestId))
+            {
+                return false;
+            }
+
+            var normalizedStatus = (status ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(normalizedStatus))
+            {
+                return false;
+            }
+
+            var isFinal = IsFinalExternalResponseStatus(normalizedStatus);
+            var isTimed = IsTimedResponseStatus(normalizedStatus);
+            if (!isFinal && !string.Equals(normalizedStatus, "pending", StringComparison.OrdinalIgnoreCase) && !isTimed)
+            {
+                normalizedStatus = NormalizeExternalCompletionStatus(normalizedStatus);
+                isFinal = true;
+            }
+
+            if (string.Equals(normalizedStatus, "pending", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var parsedTimeRemainingMs = TryGetLongValue(timeRemainingMs);
+            ExternalEffectPendingRequest pending;
+            lock (_externalEffectsSync)
+            {
+                if (!_externalPendingRequests.TryGetValue(requestId, out pending))
+                {
+                    return false;
+                }
+
+                pending.TimeoutTimer?.Destroy();
+                pending.TimeoutTimer = null;
+
+                if (!isFinal)
+                {
+                    pending.TimeoutTimer = timer.Once(
+                        GetExternalEffectTimeoutSeconds(normalizedStatus, parsedTimeRemainingMs),
+                        () => HandleExternalEffectTimeout(requestId));
+                    _externalPendingRequests[requestId] = pending;
+                }
+                else
+                {
+                    _externalPendingRequests.Remove(requestId);
+                }
+            }
+
+            var player = FindPlayerBySteamId(pending.SteamId);
+            if (!string.IsNullOrWhiteSpace(playerMessage))
+            {
+                ShowExternalProviderMessage(player, normalizedStatus, playerMessage);
+            }
+            else
+            {
+                LogVerbose($"External provider={pending.ProviderName} sent requestID={requestId} status={normalizedStatus} without playerMessage (recommended).");
+            }
+
+            if (isTimed)
+            {
+                FireAndForget(
+                    SendTimedResponseAsync(pending.Token, pending.RequestId, normalizedStatus, parsedTimeRemainingMs, reason ?? string.Empty),
+                    $"external timed response {normalizedStatus}"
+                );
+            }
+            else
+            {
+                FireAndForget(
+                    SendEffectResponseAsync(pending.Token, pending.RequestId, normalizedStatus, reason ?? string.Empty),
+                    $"external completion {normalizedStatus}"
+                );
+            }
+
+            LogVerbose($"External effect response requestID={requestId}, provider={pending.ProviderName}, status={normalizedStatus}.");
+            return true;
+        }
+
+        private JArray ParseExternalEffectsPayload(object effectsPayload)
+        {
+            if (effectsPayload == null)
+            {
+                return null;
+            }
+
+            if (effectsPayload is JArray arr)
+            {
+                return arr;
+            }
+
+            if (effectsPayload is JObject obj && obj["effects"] is JArray effectsArray)
+            {
+                return effectsArray;
+            }
+
+            if (effectsPayload is string text)
+            {
+                text = text.Trim();
+                if (string.IsNullOrEmpty(text))
+                {
+                    return null;
+                }
+
+                try
+                {
+                    if (text.StartsWith("["))
+                    {
+                        return JArray.Parse(text);
+                    }
+
+                    var parsedObj = JObject.Parse(text);
+                    if (parsedObj["effects"] is JArray parsedEffects)
+                    {
+                        return parsedEffects;
+                    }
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+
+            try
+            {
+                return JArray.FromObject(effectsPayload);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private string NormalizeExternalCompletionStatus(string status)
+        {
+            var normalized = (status ?? string.Empty).Trim();
+            if (string.Equals(normalized, "success", StringComparison.OrdinalIgnoreCase))
+            {
+                return "success";
+            }
+
+            if (string.Equals(normalized, "failPermanent", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(normalized, "fail", StringComparison.OrdinalIgnoreCase))
+            {
+                return "failPermanent";
+            }
+
+            return "failTemporary";
+        }
+
+        private bool IsFinalExternalResponseStatus(string status)
+        {
+            var normalized = (status ?? string.Empty).Trim();
+            return string.Equals(normalized, "success", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(normalized, "failTemporary", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(normalized, "failPermanent", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(normalized, "fail", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(normalized, "timedEnd", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private bool IsTimedResponseStatus(string status)
+        {
+            var normalized = (status ?? string.Empty).Trim();
+            return string.Equals(normalized, "timedBegin", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(normalized, "timedEnd", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private float GetExternalEffectTimeoutSeconds(string status, long? timeRemainingMs)
+        {
+            var timeoutSeconds = ExternalEffectPendingTimeoutSeconds;
+            if (string.Equals((status ?? string.Empty).Trim(), "timedBegin", StringComparison.OrdinalIgnoreCase) && timeRemainingMs.HasValue)
+            {
+                timeoutSeconds = Math.Max(
+                    ExternalEffectPendingTimeoutSeconds,
+                    (float)Math.Ceiling(timeRemainingMs.Value / 1000d) + 5f);
+            }
+
+            return timeoutSeconds;
+        }
+
+        private long? TryGetLongValue(object value)
+        {
+            if (value == null)
+            {
+                return null;
+            }
+
+            if (value is long longValue)
+            {
+                return longValue >= 0 ? longValue : (long?)null;
+            }
+
+            if (value is int intValue)
+            {
+                return intValue >= 0 ? intValue : (long?)null;
+            }
+
+            if (value is short shortValue)
+            {
+                return shortValue >= 0 ? shortValue : (long?)null;
+            }
+
+            if (value is uint uintValue)
+            {
+                return uintValue;
+            }
+
+            if (value is ulong ulongValue)
+            {
+                return ulongValue <= long.MaxValue ? (long)ulongValue : (long?)null;
+            }
+
+            if (value is JValue tokenValue)
+            {
+                return TryGetLongValue(tokenValue.Value);
+            }
+
+            if (long.TryParse(value.ToString(), out var parsed) && parsed >= 0)
+            {
+                return parsed;
+            }
+
+            return null;
+        }
+
+        private JArray ParseEffectIdsPayload(object effectIdsPayload)
+        {
+            if (effectIdsPayload == null)
+            {
+                return new JArray();
+            }
+
+            if (effectIdsPayload is JArray arr)
+            {
+                return arr;
+            }
+
+            if (effectIdsPayload is string text)
+            {
+                text = text.Trim();
+                if (string.IsNullOrEmpty(text))
+                {
+                    return new JArray();
+                }
+
+                try
+                {
+                    if (text.StartsWith("["))
+                    {
+                        return JArray.Parse(text);
+                    }
+                }
+                catch
+                {
+                    return new JArray();
+                }
+
+                return new JArray { text };
+            }
+
+            try
+            {
+                return JArray.FromObject(effectIdsPayload);
+            }
+            catch
+            {
+                return new JArray();
+            }
+        }
+
+        private async Task ReportEffectAvailabilityAsync(JArray effectIds, string status)
+        {
+            foreach (var kvp in _data.PlayerSessions)
+            {
+                var session = kvp.Value;
+                if (session == null || string.IsNullOrEmpty(session.Token))
+                {
+                    continue;
+                }
+
+                var arg = new JObject
+                {
+                    ["id"] = Guid.NewGuid().ToString(),
+                    ["identifierType"] = "effect",
+                    ["ids"] = (JArray)effectIds.DeepClone(),
+                    ["status"] = status,
+                    ["stamp"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                };
+
+                await SendRpcAsync(session.Token, "effectReport", new JArray { arg });
+            }
+        }
+
+        private void NotifyCrowdControlProvidersSessionStateChanged()
+        {
+            Interface.CallHook("OnCrowdControlSessionsChanged");
+        }
+
+        private async Task SyncCustomEffectsForAllSessionsAsync()
+        {
+            foreach (var kvp in _data.PlayerSessions)
+            {
+                var steamId = kvp.Key;
+                var session = kvp.Value;
+                if (session == null || string.IsNullOrWhiteSpace(session.Token))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    await SyncCustomEffectsAsync(session.Token, steamId);
+                }
+                catch (Exception ex)
+                {
+                    LogVerbose($"External effect sync refresh failed for {steamId}: {ex.Message}");
+                }
+            }
+        }
+
+        #endregion
+
+        #region Access Control
+
+        private bool CanUsePlugin(BasePlayer player)
+        {
+            if (player == null)
+            {
+                return false;
+            }
+
+            if (!IsPlayerAllowedForCrowdControl(player))
+            {
+                ShowEffectUi(player, "Crowd Control", "You do not have permission to use Crowd Control.");
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool CanUseAdminCommand(BasePlayer player)
+        {
+            if (player == null)
+            {
+                return false;
+            }
+
+            if (!permission.UserHasPermission(player.UserIDString, PermAdmin))
+            {
+                ShowErrorUi(player, $"You need the {PermAdmin} permission to use this command.");
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool IsPlayerAllowedForCrowdControl(BasePlayer player)
+        {
+            if (player == null)
+            {
+                return false;
+            }
+
+            if (_config?.AllowAllUsersWithoutPermission == true)
+            {
+                return true;
+            }
+
+            return player.IsAdmin || permission.UserHasPermission(player.UserIDString, PermUse);
+        }
+
+        #endregion
+
+        #region WebSocket
+
+        private async Task EnsureSocketConnectedAsync()
+        {
+            if (_isUnloading)
+            {
+                return;
+            }
+
+            if (!ShouldMaintainSocketConnection())
+            {
+                CloseSocketConnection();
+                return;
+            }
+
+            if (_socket != null && _socket.State == WebSocketState.Open)
+            {
+                return;
+            }
+
+            lock (_socketSync)
+            {
+                if (_isUnloading || _isSocketConnecting)
+                {
+                    return;
+                }
+                _isSocketConnecting = true;
+            }
+
+            try
+            {
+                if (DateTime.UtcNow - _lastSocketConnectUtc < TimeSpan.FromSeconds(1))
+                {
+                    return;
+                }
+
+                if (_isUnloading)
+                {
+                    return;
+                }
+
+                if (!ShouldMaintainSocketConnection())
+                {
+                    CloseSocketConnection();
+                    return;
+                }
+
+                _lastSocketConnectUtc = DateTime.UtcNow;
+
+                _socketCts?.Cancel();
+                _socket?.Abort();
+                _socket?.Dispose();
+
+                _socketCts = new CancellationTokenSource();
+                _socket = new ClientWebSocket();
+                _socket.Options.SetRequestHeader("User-Agent", UserAgent);
+                _socket.Options.KeepAliveInterval = TimeSpan.FromMinutes(SocketKeepAliveMinutes);
+
+                await _socket.ConnectAsync(new Uri(PubSubWebSocketUrl), _socketCts.Token);
+                Puts("Connected to Crowd Control PubSub WebSocket.");
+
+                FireAndForget(ReceiveLoopAsync(_socketCts.Token), "websocket receive loop");
+                FireAndForget(ResubscribeAllSessionsAsync(), "resubscribe all sessions");
+            }
+            catch (Exception ex)
+            {
+                if (_isUnloading)
+                {
+                    return;
+                }
+
+                PrintError($"WebSocket connect failed: {ex.Message}");
+                StartReconnectTimer();
+            }
+            finally
+            {
+                lock (_socketSync)
+                {
+                    _isSocketConnecting = false;
+                }
+            }
+        }
+
+        private async Task ReceiveLoopAsync(CancellationToken token)
+        {
+            var buffer = new byte[8192];
+            var sb = new StringBuilder();
+
+            try
+            {
+                while (_socket != null && _socket.State == WebSocketState.Open && !token.IsCancellationRequested && !_isUnloading)
+                {
+                    WebSocketReceiveResult result;
+                    do
+                    {
+                        result = await _socket.ReceiveAsync(new ArraySegment<byte>(buffer), token);
+                        if (result.MessageType == WebSocketMessageType.Close)
+                        {
+                            Puts("Crowd Control WebSocket closed by server.");
+                            ShowSessionDisconnectToastToActivePlayers("Crowd Control disconnected. Session may have ended.");
+                            if (!_isUnloading)
+                            {
+                                StartReconnectTimer();
+                            }
+                            return;
+                        }
+
+                        sb.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
+                    }
+                    while (!result.EndOfMessage);
+
+                    var message = sb.ToString();
+                    sb.Clear();
+                    HandleSocketMessage(message);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                if (_isUnloading)
+                {
+                    return;
+                }
+
+                PrintError($"WebSocket receive error: {ex.Message}");
+                ShowSessionDisconnectToastToActivePlayers("Crowd Control connection error. Session may have ended.");
+                StartReconnectTimer();
+            }
+        }
+
+        private void HandleSocketMessage(string json)
+        {
+            if (_isUnloading)
+            {
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return;
+            }
+
+            var trimmed = json.Trim();
+            if (!trimmed.StartsWith("{") && !trimmed.StartsWith("["))
+            {
+                //LogVerbose($"Ignoring non-JSON socket frame: {trimmed}");
+                return;
+            }
+
+            JObject msg;
+            try
+            {
+                msg = JObject.Parse(trimmed);
+            }
+            catch (Exception ex)
+            {
+                LogVerbose($"Failed parsing JSON socket frame: {ex.Message}");
+                return;
+            }
+
+            var domain = msg.Value<string>("domain");
+            var type = msg.Value<string>("type");
+            if (string.IsNullOrEmpty(type))
+            {
+                return;
+            }
+
+            var payload = msg["payload"] as JObject ?? new JObject();
+
+            switch (type)
+            {
+                case "application-auth-code":
+                    HandleApplicationAuthCode(payload);
+                    break;
+                case "application-auth-code-error":
+                    HandleApplicationAuthCodeError(payload);
+                    break;
+                case "application-auth-code-redeemed":
+                    HandleApplicationAuthCodeRedeemed(payload);
+                    break;
+                case "subscription-result":
+                    HandleSubscriptionResult(payload);
+                    break;
+                case "effect-request":
+                    if (domain == "pub")
+                    {
+                        HandleEffectRequest(payload);
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        private void HandleApplicationAuthCode(JObject payload)
+        {
+            string steamId = null;
+            lock (_pendingAuthRequests)
+            {
+                if (_pendingAuthRequests.Count > 0)
+                {
+                    steamId = _pendingAuthRequests.Dequeue();
+                }
+            }
+
+            if (string.IsNullOrEmpty(steamId))
+            {
+                PrintWarning("Received application-auth-code without any waiting player.");
+                return;
+            }
+
+            var code = payload.Value<string>("code");
+
+            if (!string.IsNullOrEmpty(code))
+            {
+                _authCodeToSteamId[code] = steamId;
+            }
+
+            var player = FindPlayerBySteamId(steamId);
+            if (player != null)
+            {
+                if (!string.IsNullOrEmpty(code))
+                {
+                    player.ConsoleMessage($"[CrowdControl] Enter this auth code into your Crowd Control app: {code}");
+                    player.ConsoleMessage("[CrowdControl] You have 3 minutes to enter this code before it expires.");
+                    ShowEffectUi(player, "Crowd Control", "Check console (F1) for instructions.");
+                }
+                else
+                {
+                    ShowEffectUi(player, "Crowd Control", "Auth code generation failed. Please run /cc link again.");
+                }
+            }
+        }
+
+        private void HandleApplicationAuthCodeError(JObject payload)
+        {
+            string steamId = null;
+            lock (_pendingAuthRequests)
+            {
+                if (_pendingAuthRequests.Count > 0)
+                {
+                    steamId = _pendingAuthRequests.Dequeue();
+                }
+            }
+
+            var message = payload.Value<string>("message") ?? "Unknown Crowd Control auth error.";
+            PrintWarning($"Crowd Control auth code error: {message}");
+
+            var player = !string.IsNullOrEmpty(steamId) ? FindPlayerBySteamId(steamId) : null;
+            if (player != null)
+            {
+                ShowEffectUi(player, "Crowd Control", $"Auth code failed: {message}");
+            }
+        }
+
+        private void HandleApplicationAuthCodeRedeemed(JObject payload)
+        {
+            var code = payload.Value<string>("code");
+            if (string.IsNullOrEmpty(code))
+            {
+                return;
+            }
+
+            if (!_authCodeToSteamId.TryGetValue(code, out var steamId))
+            {
+                PrintWarning($"Auth code redeemed but no matching player mapping for code {code}.");
+                return;
+            }
+
+            _authCodeToSteamId.Remove(code);
+            FireAndForget(ExchangeAuthCodeForTokenAsync(steamId, code), "exchange auth code");
+        }
+
+        private void HandleSubscriptionResult(JObject payload)
+        {
+            var success = payload["success"]?.ToString(Formatting.None) ?? "[]";
+            var failure = payload["failure"]?.ToString(Formatting.None) ?? "[]";
+            Puts($"Subscription result success={success}, failure={failure}");
+        }
+
+        private void StartReconnectTimer()
+        {
+            if (_isUnloading)
+            {
+                return;
+            }
+
+            if (_reconnectTimer != null && !_reconnectTimer.Destroyed)
+            {
+                return;
+            }
+
+            _reconnectTimer = timer.Once(ReconnectDelaySeconds, () =>
+            {
+                if (_isUnloading)
+                {
+                    _reconnectTimer = null;
+                    return;
+                }
+
+                _reconnectTimer = null;
+                FireAndForget(EnsureSocketConnectedAsync(), "reconnect socket");
+            });
+        }
+
+        private void StartSocketHeartbeat()
+        {
+            if (_isUnloading)
+            {
+                return;
+            }
+
+            _heartbeatTimer?.Destroy();
+            _heartbeatTimer = timer.Every(300f, () =>
+            {
+                if (_isUnloading)
+                {
+                    return;
+                }
+
+                // Keep a single shared websocket healthy; ClientWebSocket also has KeepAliveInterval set.
+                FireAndForget(SendSocketHeartbeatAsync(), "socket heartbeat");
+            });
+        }
+
+        private async Task SendSocketHeartbeatAsync()
+        {
+            if (_isUnloading)
+            {
+                return;
+            }
+
+            if (_socket == null || _socket.State != WebSocketState.Open)
+            {
+                return;
+            }
+
+            var payload = new JObject
+            {
+                ["action"] = "ping",
+                ["data"] = new JObject
+                {
+                    ["stamp"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                }
+            };
+            await SendSocketMessageAsync(payload);
+        }
+
+        private async Task SendGenerateAuthCodeAsync()
+        {
+            var payload = new JObject
+            {
+                ["action"] = "generate-auth-code",
+                ["data"] = new JObject
+                {
+                    ["appID"] = _config.AppId,
+                    ["scopes"] = JArray.FromObject(Scopes),
+                    ["packs"] = JArray.FromObject(Packs),
+                    ["qrCode"] = false
+                }
+            };
+
+            await SendSocketMessageAsync(payload);
+        }
+
+        private async Task ResubscribeAllSessionsAsync()
+        {
+            foreach (var kvp in _data.PlayerSessions)
+            {
+                var session = kvp.Value;
+                if (session == null ||
+                    string.IsNullOrEmpty(session.Token) ||
+                    string.IsNullOrEmpty(session.CcUid) ||
+                    !IsSteamPlayerOnline(kvp.Key))
+                {
+                    continue;
+                }
+
+                await SendSubscribeAsync(session.Token, session.CcUid);
+            }
+        }
+
+        private async Task SendSubscribeAsync(string token, string ccUid)
+        {
+            var topic = $"pub/{ccUid}";
+            var payload = new JObject
+            {
+                ["action"] = "subscribe",
+                ["data"] = new JObject
+                {
+                    ["token"] = token,
+                    ["topics"] = new JArray { topic }
+                }
+            };
+
+            await SendSocketMessageAsync(payload);
+        }
+
+        private async Task SendSocketMessageAsync(JObject payload)
+        {
+            if (_isUnloading)
+            {
+                return;
+            }
+
+            if (_socket == null || _socket.State != WebSocketState.Open)
+            {
+                await EnsureSocketConnectedAsync();
+            }
+
+            if (_socket == null || _socket.State != WebSocketState.Open)
+            {
+                throw new InvalidOperationException("WebSocket is not connected.");
+            }
+
+            var json = payload.ToString(Formatting.None);
+            var bytes = Encoding.UTF8.GetBytes(json);
+
+            await _sendSemaphore.WaitAsync();
+            try
+            {
+                await _socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, _socketCts.Token);
+            }
+            finally
+            {
+                _sendSemaphore.Release();
+            }
+        }
+
+        #endregion
+
+        #region HTTP Auth + Session
+
+        private async Task ExchangeAuthCodeForTokenAsync(string steamId, string code)
+        {
+            try
+            {
+                LogVerbose(
+                    $"Auth token exchange config appID={_config?.AppId ?? "(null)"}, scopes={string.Join(",", Scopes)}, secretFingerprint={BuildSecretFingerprint(_config?.AppSecret)}");
+                var endpoint = $"{OpenApiUrl}/auth/application/token";
+                var body = new JObject
+                {
+                    ["appID"] = _config.AppId,
+                    ["code"] = code,
+                    ["secret"] = _config.AppSecret
+                };
+
+                var responseJson = await PostJsonAsync(endpoint, body, includeAuth: null);
+                var token = responseJson.Value<string>("token");
+                if (string.IsNullOrEmpty(token))
+                {
+                    PrintWarning("Token exchange succeeded but no token field was present.");
+                    return;
+                }
+
+                var decoded = DecodeJwt(token);
+                if (decoded == null || string.IsNullOrEmpty(decoded.CcUid))
+                {
+                    PrintWarning("Failed to decode Crowd Control JWT.");
+                    return;
+                }
+                LogVerbose(
+                    $"Auth token decoded ccUID={decoded.CcUid}, profileType={decoded.ProfileType}, tokenScopes={decoded.ScopeSummary ?? "(missing)"}");
+
+                _data.PlayerSessions[steamId] = new PlayerSessionState
+                {
+                    SteamId = steamId,
+                    Token = token,
+                    CcUid = decoded.CcUid,
+                    OriginId = decoded.OriginId,
+                    ProfileType = decoded.ProfileType,
+                    DisplayName = decoded.Name,
+                    TokenExpiryUnix = decoded.Exp,
+                    AuthenticatedAtUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                };
+                SaveData();
+
+                if (string.IsNullOrEmpty(_data.ApplicationInstanceId))
+                {
+                    await EnsureApplicationInstanceIdAsync();
+                }
+
+                var player = FindPlayerBySteamId(steamId);
+                if (player != null)
+                {
+                    ShowEffectUi(player, "Crowd Control", "Crowd Control auth complete.");
+                    ShowEffectUi(player, "Crowd Control", $"Connected profile: {decoded.Name} ({decoded.CcUid})");
+                }
+                WarnIfBuiltInEffectsPluginMissing("auth completion", player);
+
+                if (IsSteamPlayerOnline(steamId))
+                {
+                    await SendSubscribeAsync(token, decoded.CcUid);
+                }
+
+                if (AutoStartSessionAfterAuth && IsSteamPlayerOnline(steamId))
+                {
+                    await StartGameSessionAsync(_data.PlayerSessions[steamId], steamId);
+                }
+
+                NotifyCrowdControlProvidersSessionStateChanged();
+            }
+            catch (Exception ex)
+            {
+                PrintError($"Token exchange failed for {steamId}: {ex.Message}");
+            }
+        }
+
+        private async Task StartGameSessionAsync(PlayerSessionState session, string notifySteamId = null)
+        {
+            if (session == null || string.IsNullOrEmpty(session.Token))
+            {
+                return;
+            }
+
+            var steamId = session.SteamId ?? notifySteamId ?? string.Empty;
+            if (string.IsNullOrEmpty(steamId) || !IsSteamPlayerOnline(steamId))
+            {
+                LogVerbose($"Skipping game-session start because player is offline (SteamID={steamId}).");
+                return;
+            }
+
+            if (!TryBeginSessionStart(steamId))
+            {
+                LogVerbose($"Session start already in progress for {steamId}; skipping duplicate start.");
+                return;
+            }
+
+            try
+            {
+                var instanceId = await EnsureApplicationInstanceIdAsync();
+                if (_config?.SessionRules?.EnablePriceChange == false)
+                {
+                    await SyncDefaultGameEffectOverridesAsync(session.Token, steamId, instanceId);
+                    // Sync call may refresh stale instance IDs; use latest cached value for session start.
+                    instanceId = _data?.ApplicationInstanceId ?? instanceId;
+                }
+
+                var endpoint = $"{OpenApiUrl}/game-session/start";
+                var body = new JObject
+                {
+                    ["gamePackID"] = GamePackId,
+                    ["effectReportArgs"] = new JArray(),
+                    ["sessionRules"] = new JObject
+                    {
+                        ["enableIntegrationTriggers"] = _config?.SessionRules?.EnableIntegrationTriggers ?? true,
+                        ["enablePriceChange"] = _config?.SessionRules?.EnablePriceChange ?? true,
+                        ["disableTestEffects"] = _config?.SessionRules?.DisableTestEffects ?? false,
+                        ["disableCustomEffectsSync"] = _config?.SessionRules?.DisableCustomEffectsSync ?? false
+                    }
+                };
+                if (!string.IsNullOrEmpty(_config?.AppId))
+                {
+                    var gameSessionProperty = new JObject
+                    {
+                        ["appID"] = _config.AppId
+                    };
+                    if (!string.IsNullOrEmpty(instanceId))
+                    {
+                        gameSessionProperty["instanceID"] = instanceId;
+                    }
+                    body["gameSessionProperty"] = gameSessionProperty;
+                }
+
+                var response = await PostJsonAsync(endpoint, body, includeAuth: session.Token);
+                var gameSessionId = response.Value<string>("gameSessionID");
+                if (!string.IsNullOrEmpty(gameSessionId))
+                {
+                    session.GameSessionId = gameSessionId;
+                    SaveData();
+
+                    var player = !string.IsNullOrEmpty(notifySteamId) ? FindPlayerBySteamId(notifySteamId) : null;
+                    if (player != null)
+                    {
+                        ShowEffectUi(player, "Crowd Control", "Session started!");
+                    }
+                    WarnIfBuiltInEffectsPluginMissing("game session start", player);
+
+                    if (_config?.SessionRules?.DisableCustomEffectsSync != true)
+                    {
+                        // Custom effects endpoint expects an active session context.
+                        await Task.Delay(1000);
+                        await SyncCustomEffectsAsync(session.Token, steamId);
+                    }
+
+                }
+            }
+            catch (Exception ex)
+            {
+                if (IsInstanceOwnershipError(ex.Message) || IsHttpUnauthorized(ex.Message))
+                {
+                    //LogVerbose("Session start instance ownership mismatch detected; refreshing application instance ID and retrying once.");
+                    _data.ApplicationInstanceId = string.Empty;
+                    _data.ApplicationInstanceAppId = string.Empty;
+                    SaveData();
+
+                    try
+                    {
+                        var refreshedInstanceId = await EnsureApplicationInstanceIdAsync();
+                        var retryEndpoint = $"{OpenApiUrl}/game-session/start";
+                        var retryBody = new JObject
+                        {
+                            ["gamePackID"] = GamePackId,
+                            ["effectReportArgs"] = new JArray(),
+                            ["sessionRules"] = new JObject
+                            {
+                                ["enableIntegrationTriggers"] = _config?.SessionRules?.EnableIntegrationTriggers ?? true,
+                                ["enablePriceChange"] = _config?.SessionRules?.EnablePriceChange ?? true,
+                                ["disableTestEffects"] = _config?.SessionRules?.DisableTestEffects ?? false,
+                                ["disableCustomEffectsSync"] = _config?.SessionRules?.DisableCustomEffectsSync ?? false
+                            }
+                        };
+
+                        if (!string.IsNullOrEmpty(_config?.AppId))
+                        {
+                            var retryGameSessionProperty = new JObject
+                            {
+                                ["appID"] = _config.AppId
+                            };
+                            if (!string.IsNullOrEmpty(refreshedInstanceId))
+                            {
+                                retryGameSessionProperty["instanceID"] = refreshedInstanceId;
+                            }
+                            retryBody["gameSessionProperty"] = retryGameSessionProperty;
+                        }
+
+                        var retryResponse = await PostJsonAsync(retryEndpoint, retryBody, includeAuth: session.Token);
+                        var retryGameSessionId = retryResponse.Value<string>("gameSessionID");
+                        if (!string.IsNullOrEmpty(retryGameSessionId))
+                        {
+                            session.GameSessionId = retryGameSessionId;
+                            SaveData();
+                            return;
+                        }
+                    }
+                    catch (Exception retryEx)
+                    {
+                        PrintWarning("Retry start game session after instance refresh failed: {0}", retryEx.Message);
+                    }
+                }
+
+                PrintError($"Failed to start game session: {ex.Message}");
+            }
+            finally
+            {
+                EndSessionStart(steamId);
+            }
+        }
+
+        private async Task<string> EnsureApplicationInstanceIdAsync()
+        {
+            var configuredAppId = (_config?.AppId ?? string.Empty).Trim();
+            if (!string.IsNullOrEmpty(_data?.ApplicationInstanceId) &&
+                string.Equals(_data?.ApplicationInstanceAppId ?? string.Empty, configuredAppId, StringComparison.Ordinal))
+            {
+                LogVerbose($"Using cached application instance ID: {_data.ApplicationInstanceId}");
+                return _data.ApplicationInstanceId;
+            }
+
+            if (string.IsNullOrWhiteSpace(_config?.AppId) || string.IsNullOrWhiteSpace(_config?.AppSecret))
+            {
+                LogVerbose("App credentials missing; skipping application instance ID generation.");
+                return string.Empty;
+            }
+
+            try
+            {
+                var endpoint = $"{OpenApiUrl}/auth/application/instance";
+                var body = new JObject
+                {
+                    ["appID"] = _config.AppId,
+                    ["secret"] = _config.AppSecret
+                };
+
+                var response = await PostJsonAsync(endpoint, body, includeAuth: null);
+                var instanceId = response.Value<string>("instanceID") ?? string.Empty;
+                if (string.IsNullOrEmpty(instanceId))
+                {
+                    PrintWarning("Application instance generation succeeded but no instanceID was returned.");
+                    return string.Empty;
+                }
+
+                _data.ApplicationInstanceId = instanceId;
+                _data.ApplicationInstanceAppId = configuredAppId;
+                SaveData();
+                LogVerbose($"Application instance ID ready: {instanceId}");
+                return instanceId;
+            }
+            catch (Exception ex)
+            {
+                PrintWarning("Application instance ID generation failed: {0}", ex.Message);
+                return string.Empty;
+            }
+        }
+
+        private async Task RestartGameSessionAsync(PlayerSessionState session, string notifySteamId = null)
+        {
+            if (session == null || string.IsNullOrEmpty(session.Token))
+            {
+                return;
+            }
+
+            await StopGameSessionAsync(session, notifySteamId);
+            await StartGameSessionAsync(session, notifySteamId);
+        }
+
+        private async Task SyncCustomEffectsAsync(string token, string steamId)
+        {
+            if (_config?.SessionRules?.DisableCustomEffectsSync == true)
+            {
+                LogVerbose("Custom effects sync is disabled by config; skipping.");
+                return;
+            }
+
+            if (string.IsNullOrEmpty(token))
+            {
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(steamId) &&
+                _lastCustomEffectsSyncUtc.TryGetValue(steamId, out var lastSyncUtc) &&
+                DateTime.UtcNow - lastSyncUtc < TimeSpan.FromSeconds(3))
+            {
+                LogVerbose($"Skipping duplicate custom-effects sync for {steamId}.");
+                return;
+            }
+
+            try
+            {
+                var endpoint = GetCustomEffectsEndpoint();
+                var body = BuildCustomEffectsSyncRequestBody();
+                var operations = body["operations"] as JArray;
+                if (operations == null || operations.Count == 0)
+                {
+                    LogVerbose("No custom effects configured for sync; skipping upload.");
+                    return;
+                }
+
+                await PutJsonAsync(endpoint, body, includeAuth: token);
+                if (!string.IsNullOrEmpty(steamId))
+                {
+                    _lastCustomEffectsSyncUtc[steamId] = DateTime.UtcNow;
+                }
+                LogVerbose("Custom effects synced to Crowd Control menu endpoint.");
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"Custom effects sync failed: {ex.Message}");
+            }
+        }
+
+        private bool TryBeginSessionStart(string steamId)
+        {
+            if (string.IsNullOrEmpty(steamId))
+            {
+                return true;
+            }
+
+            lock (_sessionStartInProgress)
+            {
+                if (_sessionStartInProgress.Contains(steamId))
+                {
+                    return false;
+                }
+
+                _sessionStartInProgress.Add(steamId);
+                return true;
+            }
+        }
+
+        private void EndSessionStart(string steamId)
+        {
+            if (string.IsNullOrEmpty(steamId))
+            {
+                return;
+            }
+
+            lock (_sessionStartInProgress)
+            {
+                _sessionStartInProgress.Remove(steamId);
+            }
+        }
+
+        private string GetCustomEffectsEndpoint()
+        {
+            return $"{OpenApiUrl}/menu/custom-effects";
+        }
+
+        private string GetDefaultGameEffectsEndpoint()
+        {
+            return $"{OpenApiUrl}/menu/effects/default";
+        }
+
+        private JObject BuildCustomEffectsSyncRequestBody()
+        {
+            var effects = BuildCustomEffectsPayload();
+
+            var operations = BuildChunkedCustomEffectOperations(effects, CustomEffectsPerOperation);
+
+            return new JObject
+            {
+                ["gamePackID"] = GamePackId,
+                ["operations"] = operations
+            };
+        }
+
+        private async Task SyncDefaultGameEffectOverridesAsync(string token, string steamId, string instanceId)
+        {
+            if (string.IsNullOrEmpty(token))
+            {
+                return;
+            }
+
+            if (string.IsNullOrEmpty(instanceId))
+            {
+                LogVerbose("No application instance ID available; skipping default game effect override sync.");
+                return;
+            }
+
+            var entries = LoadOrSeedEffectPricingEntries();
+            if (entries.Count == 0)
+            {
+                LogVerbose("No effect pricing entries available; skipping default game effect override sync.");
+                return;
+            }
+
+            var effectOverrides = new JArray();
+            for (var i = 0; i < entries.Count; i++)
+            {
+                var entry = entries[i];
+                if (string.IsNullOrWhiteSpace(entry?.EffectId))
+                {
+                    continue;
+                }
+
+                // The default-effect override endpoint only accepts default game pack effects.
+                // Local test effects are intentionally excluded from this upload.
+                if (entry.EffectId.StartsWith("test_", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var scalePercent = 0f;
+                    var scaleDuration = 0f;
+                    if (entry.Scale != null && !entry.Scale.Inactive)
+                    {
+                        scalePercent = Math.Max(0f, entry.Scale.Percent);
+                        scaleDuration = Math.Max(0f, entry.Scale.Duration);
+                    }
+
+                    var durationValue = 0f;
+                    var durationImmutable = false;
+                    if (entry.Duration != null)
+                    {
+                        durationValue = Math.Max(0f, ReadTokenAsFloat(entry.Duration["value"], 0f));
+                        durationImmutable = ReadTokenAsBool(entry.Duration["immutable"], false);
+                    }
+
+                    var overrideObj = new JObject
+                    {
+                        ["effectID"] = entry.EffectId,
+                        ["type"] = "game",
+                        ["inactive"] = entry.Inactive,
+                        ["sessionCooldown"] = Math.Max(0, entry.SessionCooldown),
+                        ["userCooldown"] = Math.Max(0, entry.UserCooldown),
+                        ["scale"] = new JObject
+                        {
+                            ["percent"] = scalePercent,
+                            ["duration"] = scaleDuration
+                        }
+                    };
+
+                    // Default-effect payload requires price >= 1.
+                    // If local pricing isn't set, force minimum 1.
+                    overrideObj["price"] = Math.Max(1, entry.Price);
+
+                    // Only include duration when it is valid (>0).
+                    if (durationValue > 0f)
+                    {
+                        overrideObj["duration"] = new JObject
+                        {
+                            ["value"] = durationValue,
+                            ["immutable"] = durationImmutable
+                        };
+                    }
+
+                    effectOverrides.Add(overrideObj);
+                }
+                catch (Exception ex)
+                {
+                    PrintWarning("Skipping default game effect override for {0}: {1}", entry.EffectId, ex.Message);
+                }
+            }
+
+            if (effectOverrides.Count == 0)
+            {
+                LogVerbose("No valid default game effect overrides to sync.");
+                return;
+            }
+
+            var sampleEntries = new List<string>();
+            var sampled = 0;
+            foreach (var tokenEntry in effectOverrides)
+            {
+                if (!(tokenEntry is JObject obj))
+                {
+                    continue;
+                }
+
+                var sampleEffectId = obj.Value<string>("effectID") ?? string.Empty;
+                var samplePrice = obj.Value<int?>("price") ?? 0;
+                sampleEntries.Add($"{sampleEffectId}=>{{price:{samplePrice}}}");
+                sampled++;
+                if (sampled >= 2)
+                {
+                    break;
+                }
+            }
+            LogVerbose($"Default effect override sample ({sampled}/{effectOverrides.Count}): {string.Join(" | ", sampleEntries)}");
+
+            var body = new JObject
+            {
+                ["gamePackID"] = GamePackId,
+                ["instanceID"] = instanceId,
+                ["effectOverrides"] = effectOverrides
+            };
+
+            try
+            {
+                var decoded = DecodeJwt(token);
+                LogVerbose(
+                    $"Posting default-effect overrides instanceID={instanceId}, effects={effectOverrides.Count}, tokenScopes={decoded?.ScopeSummary ?? "(missing)"}");
+                await PostJsonAsync(GetDefaultGameEffectsEndpoint(), body, includeAuth: token);
+                LogVerbose($"Default game effect overrides synced for {effectOverrides.Count} effect(s), steamID={steamId}.");
+            }
+            catch (Exception ex)
+            {
+                if (IsInstanceOwnershipError(ex.Message) || IsHttpUnauthorized(ex.Message))
+                {
+                    LogVerbose("Instance ownership mismatch detected; regenerating application instance ID and retrying once.");
+                    _data.ApplicationInstanceId = string.Empty;
+                    _data.ApplicationInstanceAppId = string.Empty;
+                    SaveData();
+
+                    var refreshedInstanceId = await EnsureApplicationInstanceIdAsync();
+                    if (!string.IsNullOrEmpty(refreshedInstanceId))
+                    {
+                        body["instanceID"] = refreshedInstanceId;
+                        try
+                        {
+                            await PostJsonAsync(GetDefaultGameEffectsEndpoint(), body, includeAuth: token);
+                            LogVerbose($"Default game effect overrides synced after instance refresh for {effectOverrides.Count} effect(s), steamID={steamId}.");
+                            return;
+                        }
+                        catch (Exception retryEx)
+                        {
+                            PrintWarning("Default game effect override retry failed: {0}", retryEx.Message);
+                            return;
+                        }
+                    }
+                }
+
+                // PrintWarning uses format placeholders; pass message as an argument to avoid
+                // format exceptions when HTTP responses include JSON braces.
+                PrintWarning("Default game effect override sync failed: {0}", ex.Message);
+            }
+        }
+
+        private bool IsInstanceOwnershipError(string message)
+        {
+            if (string.IsNullOrEmpty(message))
+            {
+                return false;
+            }
+
+            return message.IndexOf("not owned by application", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private bool IsHttpUnauthorized(string message)
+        {
+            if (string.IsNullOrEmpty(message))
+            {
+                return false;
+            }
+
+            return message.IndexOf("HTTP 401", StringComparison.OrdinalIgnoreCase) >= 0
+                || message.IndexOf("\"code\":\"UNAUTHORIZED\"", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private string GetEffectPricingFilePath()
+        {
+            return Path.Combine(Interface.Oxide.RootDirectory, "oxide", "plugins", EffectPricingFileName);
+        }
+
+        private List<EffectPricingEntry> LoadOrSeedEffectPricingEntries()
+        {
+            var path = GetEffectPricingFilePath();
+            var defaults = BuildDefaultEffectPricingEntriesFromBaseUpdated();
+            var byId = new Dictionary<string, EffectPricingEntry>(StringComparer.OrdinalIgnoreCase);
+            for (var i = 0; i < defaults.Count; i++)
+            {
+                var entry = defaults[i];
+                if (entry != null && !string.IsNullOrWhiteSpace(entry.EffectId))
+                {
+                    byId[entry.EffectId] = entry;
+                }
+            }
+
+            var changed = false;
+            try
+            {
+                if (File.Exists(path))
+                {
+                    var json = File.ReadAllText(path);
+                    var loaded = JsonConvert.DeserializeObject<List<EffectPricingEntry>>(json) ?? new List<EffectPricingEntry>();
+                    for (var i = 0; i < loaded.Count; i++)
+                    {
+                        var entry = loaded[i];
+                        if (entry == null || string.IsNullOrWhiteSpace(entry.EffectId))
+                        {
+                            continue;
+                        }
+
+                        entry.Scale = entry.Scale ?? new EffectPricingScaleConfig();
+                        byId[entry.EffectId] = entry;
+                    }
+                }
+                else
+                {
+                    changed = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"Failed reading {EffectPricingFileName}, using defaults: {ex.Message}");
+                changed = true;
+            }
+
+            foreach (var entry in defaults)
+            {
+                if (entry == null || string.IsNullOrWhiteSpace(entry.EffectId))
+                {
+                    continue;
+                }
+
+                if (!byId.ContainsKey(entry.EffectId))
+                {
+                    byId[entry.EffectId] = entry;
+                    changed = true;
+                }
+            }
+
+            var ordered = new List<EffectPricingEntry>(byId.Values);
+            ordered.Sort((a, b) => string.Compare(a?.EffectId, b?.EffectId, StringComparison.OrdinalIgnoreCase));
+
+            if (changed)
+            {
+                try
+                {
+                    var serialized = JsonConvert.SerializeObject(ordered, Formatting.Indented);
+                    File.WriteAllText(path, serialized + Environment.NewLine, Encoding.UTF8);
+                    LogVerbose($"Wrote {EffectPricingFileName} with {ordered.Count} effect pricing entries.");
+                }
+                catch (Exception ex)
+                {
+                    PrintWarning($"Failed writing {EffectPricingFileName}: {ex.Message}");
+                }
+            }
+
+            return ordered;
+        }
+
+        private List<EffectPricingEntry> BuildDefaultEffectPricingEntriesFromBaseUpdated()
+        {
+            var results = new List<EffectPricingEntry>();
+            var path = Path.Combine(Interface.Oxide.RootDirectory, "oxide", "plugins", "effects.json");
+            if (!File.Exists(path))
+            {
+                PrintWarning("effects.json not found; cannot auto-seed effect pricing entries.");
+                return results;
+            }
+
+            try
+            {
+                var root = JObject.Parse(File.ReadAllText(path));
+                var effects = root["effects"]?["game"] as JObject;
+                if (effects == null)
+                {
+                    return results;
+                }
+
+                foreach (var prop in effects.Properties())
+                {
+                    var effectObj = prop.Value as JObject;
+                    var entry = new EffectPricingEntry
+                    {
+                        EffectId = prop.Name,
+                        Price = effectObj?.Value<int?>("price") ?? 0,
+                        SessionCooldown = effectObj?.Value<int?>("sessionCooldown") ?? 0,
+                        UserCooldown = effectObj?.Value<int?>("userCooldown") ?? 0,
+                        Inactive = effectObj?.Value<bool?>("inactive") ?? false,
+                        Duration = effectObj?["duration"] as JObject != null
+                            ? (JObject)((JObject)effectObj["duration"]).DeepClone()
+                            : null,
+                        Scale = new EffectPricingScaleConfig
+                        {
+                            Percent = effectObj?["scale"]?["percent"]?.Value<float?>() ?? 1f,
+                            Duration = effectObj?["scale"]?["duration"]?.Value<float?>() ?? 1f,
+                            Inactive = effectObj?["scale"]?["inactive"]?.Value<bool?>() ?? true
+                        }
+                    };
+
+                    results.Add(entry);
+                }
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"Failed building default effect pricing entries from effects.json: {ex.Message}");
+            }
+
+            return results;
+        }
+
+        private Dictionary<string, string> LoadEffectNamesFromBaseUpdated()
+        {
+            var results = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var path = Path.Combine(Interface.Oxide.RootDirectory, "oxide", "plugins", "effects.json");
+            if (!File.Exists(path))
+            {
+                return results;
+            }
+
+            try
+            {
+                var root = JObject.Parse(File.ReadAllText(path));
+                var effects = root["effects"]?["game"] as JObject;
+                if (effects == null)
+                {
+                    return results;
+                }
+
+                foreach (var prop in effects.Properties())
+                {
+                    var effectObj = prop.Value as JObject;
+                    var name = effectObj?.Value<string>("name");
+                    if (!string.IsNullOrWhiteSpace(name))
+                    {
+                        results[prop.Name] = name;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"Failed loading effect names from effects.json: {ex.Message}");
+            }
+
+            return results;
+        }
+
+        private JArray BuildChunkedCustomEffectOperations(JObject effects, int perOperation)
+        {
+            var operations = new JArray();
+            if (effects == null || !effects.HasValues)
+            {
+                return operations;
+            }
+
+            operations.Add(new JObject
+            {
+                ["mode"] = "replace-all",
+                ["effects"] = effects
+            });
+
+            LogVerbose($"Prepared {effects.Count} custom effects across {operations.Count} replace-all operation(s).");
+            return operations;
+        }
+
+        private JObject BuildCustomEffectsPayload()
+        {
+
+            /*
+                Custom effects 
+
+            */
+            var effects = new JObject
+            {
+                ["player_kill"] = new JObject { ["name"] = "Player Kill", ["price"] = 300, ["description"] = "Instantly kill the player." },
+                ["test_hype_train"] = new JObject { ["name"] = "TEST: Hype Train", ["price"] = 25, ["description"] = "Test effect: spawn a short-lived hype train with stub names and sound." },
+                ["player_teleport_to_sleeping_bag"] = new JObject { ["name"] = "Teleport To Sleeping Bag", ["price"] = 220, ["description"] = "Teleport player to one of their sleeping bags." }
+            };
+
+            lock (_externalEffectsSync)
+            {
+                foreach (var kvp in _externalEffectsById)
+                {
+                    var def = kvp.Value;
+                    if (def?.MenuEffect == null || string.IsNullOrWhiteSpace(def.EffectId) || !def.SyncMenu)
+                    {
+                        continue;
+                    }
+
+                    effects[def.EffectId] = (JObject)def.MenuEffect.DeepClone();
+                }
+            }
+
+            // Intentionally kept as reference (disabled).
+            // Pricing enforcement is now handled by CrowdControl-Effects.json + replace-partial sync.
+            /*
+            if (_config?.SessionRules != null && !_config.SessionRules.EnablePriceChange)
+            {
+                foreach (var prop in effects.Properties())
+                {
+                    var effect = prop.Value as JObject;
+                    effect?.Remove("price");
+                }
+            }
+            */
+
+            return effects;
+        }
+
+        private async Task StopGameSessionAsync(PlayerSessionState session, string notifySteamId = null)
+        {
+            if (session == null || string.IsNullOrEmpty(session.Token))
+            {
+                return;
+            }
+
+            if (string.IsNullOrEmpty(session.GameSessionId))
+            {
+                return;
+            }
+
+            try
+            {
+                var endpoint = $"{OpenApiUrl}/game-session/stop";
+                var body = new JObject
+                {
+                    ["gameSessionID"] = session.GameSessionId
+                };
+
+                await PostJsonAsync(endpoint, body, includeAuth: session.Token);
+                session.GameSessionId = null;
+
+                var hasActiveSessions = false;
+                foreach (var playerSession in _data.PlayerSessions.Values)
+                {
+                    if (!string.IsNullOrEmpty(playerSession?.GameSessionId))
+                    {
+                        hasActiveSessions = true;
+                        break;
+                    }
+                }
+
+                if (!hasActiveSessions)
+                {
+                    _data.ApplicationInstanceId = string.Empty;
+                    _data.ApplicationInstanceAppId = string.Empty;
+                }
+
+                SaveData();
+
+                var player = !string.IsNullOrEmpty(notifySteamId) ? FindPlayerBySteamId(notifySteamId) : null;
+                if (player != null)
+                {
+                    ShowErrorUi(player, "Crowd Control session ended or disconnected.");
+                }
+
+                NotifyCrowdControlProvidersSessionStateChanged();
+            }
+            catch (Exception ex)
+            {
+                PrintError($"Failed to stop game session: {ex.Message}");
+            }
+        }
+
+        private Task<JObject> PostJsonAsync(string url, JObject payload, string includeAuth)
+        {
+            return SendJsonAsync(url, payload, includeAuth, Oxide.Core.Libraries.RequestMethod.POST);
+        }
+
+        private Task<JObject> PutJsonAsync(string url, JObject payload, string includeAuth)
+        {
+            return SendJsonAsync(url, payload, includeAuth, Oxide.Core.Libraries.RequestMethod.PUT);
+        }
+
+        private Task<JObject> SendJsonAsync(
+            string url,
+            JObject payload,
+            string includeAuth,
+            Oxide.Core.Libraries.RequestMethod method
+        )
+        {
+            var tcs = new TaskCompletionSource<JObject>();
+            var headers = new Dictionary<string, string>
+            {
+                ["Content-Type"] = "application/json",
+                ["Accept"] = "application/json",
+                ["User-Agent"] = UserAgent
+            };
+
+            if (!string.IsNullOrEmpty(includeAuth))
+            {
+                headers["Authorization"] = $"cc-auth-token {includeAuth}";
+            }
+            if (method == Oxide.Core.Libraries.RequestMethod.PUT)
+            {
+                // Compatibility fallback for environments that tunnel PUT behind POST handlers.
+                headers["X-HTTP-Method-Override"] = "PUT";
+            }
+
+            webrequest.Enqueue(
+                url,
+                payload.ToString(Formatting.None),
+                (code, response) =>
+                {
+                    if (code < 200 || code >= 300)
+                    {
+                        tcs.TrySetException(new Exception($"HTTP {code}: {response ?? string.Empty}"));
+                        return;
+                    }
+
+                    if (string.IsNullOrEmpty(response))
+                    {
+                        tcs.TrySetResult(new JObject());
+                        return;
+                    }
+
+                    try
+                    {
+                        tcs.TrySetResult(JObject.Parse(response));
+                    }
+                    catch
+                    {
+                        tcs.TrySetResult(new JObject());
+                    }
+                },
+                this,
+                method,
+                headers,
+                20f);
+
+            return tcs.Task;
+        }
+
+
+        #endregion
+
+        #region Effect Lifecycle
+
+        private void HandleEffectRequest(JObject payload)
+        {
+            HandleEffectRequest(payload, false);
+        }
+
+        private void HandleEffectRequest(JObject payload, bool isRetryAttempt)
+        {
+            if (_isUnloading)
+            {
+                return;
+            }
+
+            var requestId = payload.Value<string>("requestID");
+            var effect = payload["effect"] as JObject;
+            if (string.IsNullOrEmpty(requestId) || effect == null)
+            {
+                LogVerbose("Ignoring effect-request with missing requestID or effect payload.");
+                return;
+            }
+
+            var effectId = effect.Value<string>("effectID") ?? string.Empty;
+
+            var effectType = effect.Value<string>("type")
+                ?? effect.Value<string>("effectType")
+                ?? payload.Value<string>("type")
+                ?? payload.Value<string>("effectType")
+                ?? string.Empty;
+            if (!IsSupportedEffectType(effectType, effectId))
+            {
+                //LogVerbose($"Ignoring unsupported effect requestID={requestId}, effectID={effectId}, effectType={effectType}.");
+                ClearEffectRetryState(requestId);
+                return;
+            }
+
+            if (!isRetryAttempt && !TryRegisterRequestId(requestId))
+            {
+                LogVerbose($"Ignoring duplicate effect requestID={requestId}.");
+                return;
+            }
+
+            var durationSeconds = effect.Value<int?>("duration") ?? 0;
+            LogVerbose($"Effect request received requestID={requestId}, effectID={effectId}, duration={durationSeconds}s.");
+
+            var targetCcUid = payload["target"]?["ccUID"]?.ToString();
+            var steamId = FindSteamIdByCcUid(targetCcUid);
+            if (string.IsNullOrEmpty(steamId) &&
+                _activeEffectRetries.TryGetValue(requestId, out var retryState) &&
+                !string.IsNullOrEmpty(retryState?.SteamId))
+            {
+                steamId = retryState.SteamId;
+            }
+            if (string.IsNullOrEmpty(steamId))
+            {
+                PrintWarning($"Could not map effect request {requestId} target ccUID={targetCcUid} to a SteamID.");
+                return;
+            }
+
+            var responseToken = string.Empty;
+            if (!_data.PlayerSessions.TryGetValue(steamId, out var session) || string.IsNullOrEmpty(session.Token))
+            {
+                if (_activeEffectRetries.TryGetValue(requestId, out var missingSessionRetryState) &&
+                    !string.IsNullOrEmpty(missingSessionRetryState?.Token))
+                {
+                    responseToken = missingSessionRetryState.Token;
+                    const string missingSessionReason = "Target session is not currently available.";
+                    if (TryScheduleEffectRetry(requestId, payload, effect, effectId, durationSeconds, steamId, responseToken, missingSessionReason))
+                    {
+                        return;
+                    }
+
+                    FireAndForget(SendEffectResponseAsync(responseToken, requestId, "failTemporary", missingSessionReason), "effect missing session");
+                    return;
+                }
+
+                PrintWarning($"No active token for SteamID {steamId}; cannot answer effect request {requestId}.");
+                return;
+            }
+            responseToken = session.Token;
+
+            var player = FindPlayerBySteamId(steamId);
+            if (player == null || !player.IsConnected)
+            {
+                const string offlineReason = "Target player is currently offline.";
+                LogVerbose($"Effect requestID={requestId} target SteamID={steamId} is offline; evaluating retry.");
+                if (TryScheduleEffectRetry(requestId, payload, effect, effectId, durationSeconds, steamId, responseToken, offlineReason))
+                {
+                    return;
+                }
+
+                FireAndForget(SendEffectResponseAsync(responseToken, requestId, "failTemporary", offlineReason), "effect failTemporary offline");
+                return;
+            }
+
+            if (IsEffectBlockedBySessionRules(payload, effect, out var blockedReason))
+            {
+                LogVerbose($"Effect request blocked by session rules requestID={requestId}, effectID={effectId}, reason={blockedReason}");
+                if ((_config?.SessionRules?.DisableTestEffects ?? false) && IsTestEffectRequest(payload, effect))
+                {
+                    ShowEffectUi(player, "Crowd Control", "Test effect received, but test effects are disabled and it will not activate.");
+                }
+
+                ClearEffectRetryState(requestId);
+                FireAndForget(SendEffectResponseAsync(responseToken, requestId, "failTemporary", blockedReason), "effect blocked by rules");
+                return;
+            }
+
+            LogVerbose($"Effect requestID={requestId} resolved to player={player.displayName} ({steamId}).");
+            if (TryDispatchExternalEffect(
+                    requestId,
+                    effectId,
+                    responseToken,
+                    player,
+                    payload,
+                    effect,
+                    out var externalStatus,
+                    out var externalReason,
+                    out var externalPlayerMessage,
+                    out var pendingExternal,
+                    out var externalTimeRemainingMs))
+            {
+                if (!string.IsNullOrWhiteSpace(externalPlayerMessage))
+                {
+                    ShowExternalProviderMessage(player, externalStatus, externalPlayerMessage);
+                }
+                else
+                {
+                    LogVerbose($"External provider result requestID={requestId}, effectID={effectId} omitted playerMessage (recommended).");
+                }
+
+                if (pendingExternal)
+                {
+                    if (string.Equals(externalStatus, "timedBegin", StringComparison.OrdinalIgnoreCase))
+                    {
+                        FireAndForget(
+                            SendTimedResponseAsync(responseToken, requestId, "timedBegin", externalTimeRemainingMs, externalReason ?? string.Empty),
+                            "external effect timedBegin"
+                        );
+                    }
+                    return;
+                }
+
+                ClearEffectRetryState(requestId);
+                FireAndForget(
+                    SendEffectResponseAsync(responseToken, requestId, externalStatus, externalReason ?? string.Empty),
+                    $"external effect {externalStatus}"
+                );
+                return;
+            }
+
+            const string unhandledReason = "No registered provider handled this effect.";
+            LogVerbose($"Effect request requestID={requestId}, effectID={effectId} had no registered provider.");
+            ClearEffectRetryState(requestId);
+            FireAndForget(
+                SendEffectResponseAsync(responseToken, requestId, "failPermanent", unhandledReason),
+                "effect failPermanent unhandled"
+            );
+        }
+
+        private bool TryScheduleEffectRetry(
+            string requestId,
+            JObject payload,
+            JObject effect,
+            string effectId,
+            int durationSeconds,
+            string steamId,
+            string token,
+            string failureReason
+        )
+        {
+            if (string.IsNullOrEmpty(requestId) || payload == null || effect == null)
+            {
+                return false;
+            }
+
+            if (!IsRetryableFailure(effectId, failureReason))
+            {
+                LogVerbose(
+                    $"Retry skipped requestID={requestId}, effectID={effectId}, reason={failureReason ?? string.Empty}"
+                );
+                ClearEffectRetryState(requestId);
+                return false;
+            }
+
+            var sourceType = GetRetrySourceType(payload, effect);
+            var policy = GetRetryPolicy(sourceType);
+            var now = DateTime.UtcNow;
+
+            if (!_activeEffectRetries.TryGetValue(requestId, out var state))
+            {
+                state = new EffectRetryState
+                {
+                    RequestId = requestId,
+                    EffectId = effectId,
+                    SteamId = steamId,
+                    Token = token,
+                    Payload = (JObject)payload.DeepClone(),
+                    Effect = (JObject)effect.DeepClone(),
+                    DurationSeconds = durationSeconds,
+                    SourceType = sourceType,
+                    AttemptsMade = 1, // first failed attempt has already happened
+                    MaxAttempts = policy.maxAttempts,
+                    MaxDuration = TimeSpan.FromSeconds(policy.maxDurationSeconds),
+                    RetryIntervalSeconds = policy.retryIntervalSeconds,
+                    FirstFailureUtc = now,
+                    LastError = failureReason ?? string.Empty
+                };
+                _activeEffectRetries[requestId] = state;
+            }
+            else
+            {
+                state.SteamId = steamId;
+                state.Token = token;
+                state.LastError = failureReason ?? string.Empty;
+                state.AttemptsMade++;
+            }
+
+            var retryLifetime = now - state.FirstFailureUtc;
+            if (state.AttemptsMade >= state.MaxAttempts || retryLifetime >= state.MaxDuration)
+            {
+                LogVerbose(
+                    $"Retry exhausted requestID={requestId}, effectID={effectId}, source={state.SourceType}, attempts={state.AttemptsMade}/{state.MaxAttempts}, elapsed={retryLifetime.TotalSeconds:0.0}s, reason={state.LastError}"
+                );
+                ClearEffectRetryState(requestId);
+                return false;
+            }
+
+            state.RetryTimer?.Destroy();
+            state.RetryTimer = timer.Once(state.RetryIntervalSeconds, () => ExecuteEffectRetry(requestId));
+
+            var remainingAttempts = Math.Max(0, state.MaxAttempts - state.AttemptsMade);
+            var remainingSeconds = Math.Max(0.0, (state.MaxDuration - retryLifetime).TotalSeconds);
+            LogVerbose(
+                $"Queued retry requestID={requestId}, effectID={effectId}, source={state.SourceType}, attempt={state.AttemptsMade}/{state.MaxAttempts}, nextAttempt={Math.Min(state.AttemptsMade + 1, state.MaxAttempts)}/{state.MaxAttempts}, elapsed={retryLifetime.TotalSeconds:0.0}s/{state.MaxDuration.TotalSeconds:0.0}s, nextIn={state.RetryIntervalSeconds:0.0}s, remainingAttempts={remainingAttempts}, remainingSeconds={remainingSeconds:0.0}, reason={state.LastError}"
+            );
+            return true;
+        }
+
+        private void ExecuteEffectRetry(string requestId)
+        {
+            if (_isUnloading || string.IsNullOrEmpty(requestId))
+            {
+                return;
+            }
+
+            if (!_activeEffectRetries.TryGetValue(requestId, out var state))
+            {
+                return;
+            }
+
+            if (state.Payload == null)
+            {
+                ClearEffectRetryState(requestId);
+                return;
+            }
+
+            try
+            {
+                var retryLifetime = DateTime.UtcNow - state.FirstFailureUtc;
+                var nextAttempt = Math.Min(state.AttemptsMade + 1, state.MaxAttempts);
+                var remainingSeconds = Math.Max(0.0, (state.MaxDuration - retryLifetime).TotalSeconds);
+                LogVerbose(
+                    $"Executing retry requestID={requestId}, effectID={state.EffectId}, source={state.SourceType}, attempt={nextAttempt}/{state.MaxAttempts}, elapsed={retryLifetime.TotalSeconds:0.0}s/{state.MaxDuration.TotalSeconds:0.0}s, remainingSeconds={remainingSeconds:0.0}"
+                );
+                HandleEffectRequest((JObject)state.Payload.DeepClone(), true);
+            }
+            catch (Exception ex)
+            {
+                LogVerbose($"Retry execution threw for requestID={requestId}: {ex.Message}");
+                if (!TryScheduleEffectRetry(
+                        state.RequestId,
+                        state.Payload,
+                        state.Effect ?? new JObject(),
+                        state.EffectId ?? string.Empty,
+                        state.DurationSeconds,
+                        state.SteamId ?? string.Empty,
+                        state.Token ?? string.Empty,
+                        ex.Message))
+                {
+                    var finalReason = string.IsNullOrWhiteSpace(state.LastError) ? "Effect retry exhausted." : state.LastError;
+                    FireAndForget(SendEffectResponseAsync(state.Token, state.RequestId, "failTemporary", finalReason), "effect failTemporary retry exhausted");
+                }
+            }
+        }
+
+        private void ClearEffectRetryState(string requestId)
+        {
+            if (string.IsNullOrEmpty(requestId))
+            {
+                return;
+            }
+
+            if (_activeEffectRetries.TryGetValue(requestId, out var state))
+            {
+                state?.RetryTimer?.Destroy();
+                _activeEffectRetries.Remove(requestId);
+            }
+        }
+
+        private bool IsRetryableFailure(string effectId, string failureReason)
+        {
+            var normalized = NormalizeEffectId(effectId);
+            var reason = (failureReason ?? string.Empty).Trim();
+            if (string.IsNullOrEmpty(normalized))
+            {
+                return false;
+            }
+
+            if (reason.IndexOf("Unknown instant effectID", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                reason.IndexOf("Unknown timed effectID", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                reason.IndexOf("currently disabled by server settings", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                reason.IndexOf("blocked by server settings", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                reason.IndexOf("Metabolism state is unavailable", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private string GetRetrySourceType(JObject payload, JObject effect)
+        {
+            var joined = BuildSearchableJsonText(payload, effect);
+            if (ContainsAny(joined, "tiktok"))
+            {
+                return "tiktok";
+            }
+
+            if (ContainsAny(joined, "twitch"))
+            {
+                return "twitch";
+            }
+
+            return "default";
+        }
+
+        private (int maxAttempts, int maxDurationSeconds, float retryIntervalSeconds) GetRetryPolicy(string sourceType)
+        {
+            var cfg = _config?.RetryPolicy;
+            if (cfg == null || !cfg.Enabled)
+            {
+                return (1, 1, 0.5f);
+            }
+
+            RetrySourcePolicyConfig selected;
+            if (string.Equals(sourceType, "tiktok", StringComparison.OrdinalIgnoreCase))
+            {
+                selected = cfg.Tiktok ?? cfg.Default;
+            }
+            else if (string.Equals(sourceType, "twitch", StringComparison.OrdinalIgnoreCase))
+            {
+                selected = cfg.Twitch ?? cfg.Default;
+            }
+            else
+            {
+                selected = cfg.Default;
+            }
+
+            selected = selected ?? new RetrySourcePolicyConfig();
+
+            var attempts = Mathf.Clamp(selected.MaxAttempts, 1, 1000);
+            var durationSeconds = Mathf.Clamp(selected.MaxDurationSeconds, 1, 3600);
+            var interval = selected.RetryIntervalSeconds > 0f
+                ? selected.RetryIntervalSeconds
+                : durationSeconds / (float)attempts;
+            interval = Mathf.Clamp(interval, 0.25f, 10f);
+
+            return (attempts, durationSeconds, interval);
+        }
+
+        private bool ShouldUseTemporaryFailure(string effectId, string error)
+        {
+            var normalized = NormalizeEffectId(effectId);
+            var message = error ?? string.Empty;
+
+            if (message.IndexOf("Unable to spawn at current location", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            if (message.IndexOf("Failed to spawn", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            switch (normalized)
+            {
+                case "spawn_minicopter":
+                case "spawn_attack_helicopter":
+                case "spawn_supply_drop":
+                case "spawn_horse":
+                    return true;
+                default:
+                    return normalized.StartsWith("spawn_", StringComparison.Ordinal);
+            }
+        }
+
+        private string NormalizeEffectId(string effectId)
+        {
+            return (effectId ?? string.Empty).Trim().ToLowerInvariant();
+        }
+
+        private bool IsSupportedEffectType(string effectType, string effectId)
+        {
+            if (string.Equals(effectType, "game", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (string.Equals(NormalizeEffectId(effectId), "test_hype_train", StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            if (IsExternalEffectRegistered(effectId))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool IsExternalEffectRegistered(string effectId)
+        {
+            var normalized = NormalizeEffectId(effectId);
+            if (string.IsNullOrEmpty(normalized))
+            {
+                return false;
+            }
+
+            lock (_externalEffectsSync)
+            {
+                return _externalEffectsById.ContainsKey(normalized);
+            }
+        }
+
+        private bool TryDispatchExternalEffect(
+            string requestId,
+            string effectId,
+            string responseToken,
+            BasePlayer player,
+            JObject payload,
+            JObject effectPayload,
+            out string status,
+            out string reason,
+            out string playerMessage,
+            out bool pending,
+            out long? timeRemainingMs)
+        {
+            status = string.Empty;
+            reason = string.Empty;
+            playerMessage = string.Empty;
+            pending = false;
+            timeRemainingMs = null;
+
+            var normalizedEffectId = NormalizeEffectId(effectId);
+            ExternalEffectDefinition definition = null;
+            lock (_externalEffectsSync)
+            {
+                if (!_externalEffectsById.TryGetValue(normalizedEffectId, out definition))
+                {
+                    return false;
+                }
+            }
+
+            if (definition == null || string.IsNullOrWhiteSpace(definition.ProviderName))
+            {
+                status = "failTemporary";
+                reason = "External effect provider is not configured.";
+                return true;
+            }
+
+            var providerPlugin = plugins.Find(definition.ProviderName);
+            if (providerPlugin == null)
+            {
+                status = "failTemporary";
+                reason = $"External effect provider '{definition.ProviderName}' is unavailable.";
+                return true;
+            }
+
+            var context = new JObject
+            {
+                ["requestID"] = requestId,
+                ["effectID"] = effectId,
+                ["provider"] = definition.ProviderName,
+                ["playerSteamID"] = player?.UserIDString ?? string.Empty,
+                ["playerName"] = player?.displayName ?? string.Empty,
+                ["effect"] = effectPayload != null ? (JObject)effectPayload.DeepClone() : new JObject(),
+                ["payload"] = payload != null ? (JObject)payload.DeepClone() : new JObject()
+            };
+
+            object providerResult;
+            try
+            {
+                providerResult = providerPlugin.Call(ExternalEffectHookName, context);
+            }
+            catch (Exception ex)
+            {
+                status = "failTemporary";
+                reason = $"External effect provider threw an exception: {ex.Message}";
+                return true;
+            }
+
+            ParseExternalProviderResult(providerResult, out status, out reason, out playerMessage, out pending, out timeRemainingMs);
+
+            if (!pending)
+            {
+                status = NormalizeExternalCompletionStatus(status);
+                return true;
+            }
+
+            var pendingState = new ExternalEffectPendingRequest
+            {
+                RequestId = requestId,
+                EffectId = effectId,
+                ProviderName = definition.ProviderName,
+                SteamId = player?.UserIDString ?? string.Empty,
+                Token = responseToken
+            };
+            pendingState.TimeoutTimer = timer.Once(
+                GetExternalEffectTimeoutSeconds(status, timeRemainingMs),
+                () => HandleExternalEffectTimeout(requestId));
+
+            lock (_externalEffectsSync)
+            {
+                if (_externalPendingRequests.TryGetValue(requestId, out var existingPending))
+                {
+                    existingPending?.TimeoutTimer?.Destroy();
+                }
+                _externalPendingRequests[requestId] = pendingState;
+            }
+
+            LogVerbose($"External effect pending requestID={requestId}, effectID={effectId}, provider={definition.ProviderName}, status={status}.");
+            return true;
+        }
+
+        private void ParseExternalProviderResult(object providerResult, out string status, out string reason, out string playerMessage, out bool pending, out long? timeRemainingMs)
+        {
+            status = "success";
+            reason = string.Empty;
+            playerMessage = string.Empty;
+            pending = false;
+            timeRemainingMs = null;
+
+            if (providerResult == null)
+            {
+                return;
+            }
+
+            if (providerResult is bool ok)
+            {
+                status = ok ? "success" : "failTemporary";
+                reason = ok ? string.Empty : "External effect provider returned failure.";
+                return;
+            }
+
+            if (providerResult is string statusText)
+            {
+                var normalized = (statusText ?? string.Empty).Trim();
+                if (string.Equals(normalized, "pending", StringComparison.OrdinalIgnoreCase))
+                {
+                    pending = true;
+                    status = "pending";
+                    reason = "Pending external completion.";
+                    return;
+                }
+
+                if (string.Equals(normalized, "timedBegin", StringComparison.OrdinalIgnoreCase))
+                {
+                    pending = true;
+                }
+
+                status = normalized;
+                return;
+            }
+
+            if (providerResult is JObject obj)
+            {
+                status = obj.Value<string>("status") ?? "success";
+                reason = obj.Value<string>("reason") ?? string.Empty;
+                playerMessage = obj.Value<string>("playerMessage")
+                    ?? obj.Value<string>("message")
+                    ?? string.Empty;
+                pending = string.Equals(status, "pending", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(status, "timedBegin", StringComparison.OrdinalIgnoreCase) ||
+                    obj.Value<bool?>("pending") == true;
+                timeRemainingMs = obj.Value<long?>("timeRemainingMs")
+                    ?? obj.Value<long?>("timeRemaining")
+                    ?? obj.Value<long?>("durationMs");
+                return;
+            }
+        }
+
+        private void HandleExternalEffectTimeout(string requestId)
+        {
+            if (string.IsNullOrWhiteSpace(requestId))
+            {
+                return;
+            }
+
+            ExternalEffectPendingRequest pendingState;
+            lock (_externalEffectsSync)
+            {
+                if (!_externalPendingRequests.TryGetValue(requestId, out pendingState))
+                {
+                    return;
+                }
+                _externalPendingRequests.Remove(requestId);
+            }
+
+            pendingState?.TimeoutTimer?.Destroy();
+            FireAndForget(
+                SendEffectResponseAsync(pendingState?.Token, requestId, "failTemporary", "External effect timed out waiting for provider completion."),
+                "external effect timeout"
+            );
+            LogVerbose($"External effect timed out requestID={requestId}, provider={pendingState?.ProviderName}.");
+        }
+
+        private void ShowExternalProviderMessage(BasePlayer player, string status, string playerMessage)
+        {
+            if (player == null || !player.IsConnected || string.IsNullOrWhiteSpace(playerMessage))
+            {
+                return;
+            }
+
+            var normalized = (status ?? string.Empty).Trim();
+            if (string.Equals(normalized, "pending", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(normalized, "timedBegin", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(normalized, "timedEnd", StringComparison.OrdinalIgnoreCase))
+            {
+                ShowEffectUi(player, "Crowd Control", playerMessage);
+                return;
+            }
+
+            var normalizedStatus = NormalizeExternalCompletionStatus(normalized);
+            if (string.Equals(normalizedStatus, "success", StringComparison.OrdinalIgnoreCase))
+            {
+                ShowEffectUi(player, "Crowd Control", playerMessage);
+                return;
+            }
+
+            ShowErrorUi(player, playerMessage);
+        }
+
+        private bool IsGenericSpawnEffect(string effectId)
+        {
+            if (string.IsNullOrEmpty(effectId))
+            {
+                return false;
+            }
+
+            if (!effectId.StartsWith("spawn_", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            if (effectId.StartsWith("spawn_item_", StringComparison.Ordinal) ||
+                effectId.StartsWith("spawn_weapon_", StringComparison.Ordinal) ||
+                effectId.StartsWith("spawn_explosive", StringComparison.Ordinal) ||
+                effectId.StartsWith("spawn_nodes", StringComparison.Ordinal) ||
+                effectId == "spawn_airdrop_signal")
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool TryRegisterRequestId(string requestId)
+        {
+            if (string.IsNullOrEmpty(requestId))
+            {
+                return true;
+            }
+
+            lock (_requestIdSync)
+            {
+                if (_recentHandledRequestIds.TryGetValue(requestId, out var seenAt))
+                {
+                    if (DateTime.UtcNow - seenAt < TimeSpan.FromMinutes(5))
+                    {
+                        return false;
+                    }
+                }
+
+                _recentHandledRequestIds[requestId] = DateTime.UtcNow;
+                if (_recentHandledRequestIds.Count <= 2048)
+                {
+                    return true;
+                }
+
+                var cutoff = DateTime.UtcNow.AddMinutes(-10);
+                var toRemove = new List<string>();
+                foreach (var kvp in _recentHandledRequestIds)
+                {
+                    if (kvp.Value < cutoff)
+                    {
+                        toRemove.Add(kvp.Key);
+                    }
+                }
+
+                foreach (var key in toRemove)
+                {
+                    _recentHandledRequestIds.Remove(key);
+                }
+            }
+
+            return true;
+        }
+
+        private async Task SendEffectResponseAsync(string token, string requestId, string status, string message)
+        {
+            var arg = new JObject
+            {
+                ["id"] = Guid.NewGuid().ToString(),
+                ["request"] = requestId,
+                ["status"] = status,
+                ["message"] = message ?? string.Empty,
+                ["stamp"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            };
+
+            await SendRpcAsync(token, "effectResponse", new JArray { arg });
+        }
+
+        private async Task SendTimedResponseAsync(string token, string requestId, string status, long? timeRemainingMs, string message)
+        {
+            var arg = new JObject
+            {
+                ["id"] = Guid.NewGuid().ToString(),
+                ["request"] = requestId,
+                ["status"] = status,
+                ["message"] = message ?? string.Empty,
+                ["stamp"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            };
+
+            if (timeRemainingMs.HasValue && status != "timedEnd")
+            {
+                arg["timeRemaining"] = timeRemainingMs.Value;
+            }
+
+            await SendRpcAsync(token, "effectResponse", new JArray { arg });
+        }
+
+        private async Task SendRpcAsync(string token, string method, JArray args)
+        {
+            var payload = new JObject
+            {
+                ["action"] = "rpc",
+                ["data"] = new JObject
+                {
+                    ["token"] = token,
+                    ["call"] = new JObject
+                    {
+                        ["type"] = "call",
+                        ["id"] = Guid.NewGuid().ToString(),
+                        ["method"] = method,
+                        ["args"] = args
+                    }
+                }
+            };
+
+            await SendSocketMessageAsync(payload);
+        }
+
+        #endregion
+
+        #region Utility
+
+        private BasePlayer FindPlayerBySteamId(string steamId)
+        {
+            if (!ulong.TryParse(steamId, out var id))
+            {
+                return null;
+            }
+
+            return BasePlayer.FindByID(id) ?? BasePlayer.FindSleeping(id);
+        }
+
+        private bool IsSteamPlayerOnline(string steamId)
+        {
+            var player = FindPlayerBySteamId(steamId);
+            return player != null && player.IsConnected;
+        }
+
+        private bool HasAnyOnlinePlayerWithToken()
+        {
+            if (_data?.PlayerSessions == null || _data.PlayerSessions.Count == 0)
+            {
+                return false;
+            }
+
+            foreach (var kvp in _data.PlayerSessions)
+            {
+                var session = kvp.Value;
+                if (session == null || string.IsNullOrEmpty(session.Token))
+                {
+                    continue;
+                }
+
+                if (IsSteamPlayerOnline(kvp.Key))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private bool HasPendingAuthRequests()
+        {
+            lock (_pendingAuthRequests)
+            {
+                return _pendingAuthRequests.Count > 0;
+            }
+        }
+
+        private bool ShouldMaintainSocketConnection()
+        {
+            return HasAnyOnlinePlayerWithToken() || HasPendingAuthRequests();
+        }
+
+        private void CloseSocketConnection()
+        {
+            _reconnectTimer?.Destroy();
+            _reconnectTimer = null;
+            _socketCts?.Cancel();
+            _socket?.Abort();
+            _socket?.Dispose();
+            _socket = null;
+            _socketCts = null;
+        }
+
+        private string FindSteamIdByCcUid(string ccUid)
+        {
+            if (string.IsNullOrEmpty(ccUid))
+            {
+                return null;
+            }
+
+            foreach (var kvp in _data.PlayerSessions)
+            {
+                if (string.Equals(kvp.Value?.CcUid, ccUid, StringComparison.OrdinalIgnoreCase))
+                {
+                    return kvp.Key;
+                }
+            }
+            return null;
+        }
+
+        private DecodedJwt DecodeJwt(string jwt)
+        {
+            if (string.IsNullOrEmpty(jwt))
+            {
+                return null;
+            }
+
+            var parts = jwt.Split('.');
+            if (parts.Length < 2)
+            {
+                return null;
+            }
+
+            try
+            {
+                var payload = parts[1]
+                    .Replace('-', '+')
+                    .Replace('_', '/');
+                switch (payload.Length % 4)
+                {
+                    case 2:
+                        payload += "==";
+                        break;
+                    case 3:
+                        payload += "=";
+                        break;
+                }
+
+                var bytes = Convert.FromBase64String(payload);
+                var json = Encoding.UTF8.GetString(bytes);
+                var obj = JObject.Parse(json);
+
+                return new DecodedJwt
+                {
+                    CcUid = obj.Value<string>("ccUID"),
+                    OriginId = obj.Value<string>("originID"),
+                    ProfileType = obj.Value<string>("profileType"),
+                    Name = obj.Value<string>("name"),
+                    Exp = obj.Value<long?>("exp") ?? 0,
+                    ScopeSummary = GetScopeSummaryFromClaims(obj["scope"] ?? obj["scopes"])
+                };
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private string GetScopeSummaryFromClaims(JToken token)
+        {
+            if (token == null)
+            {
+                return null;
+            }
+
+            if (token.Type == JTokenType.Array)
+            {
+                var scopes = new List<string>();
+                foreach (var item in token as JArray)
+                {
+                    var value = item?.ToString();
+                    if (!string.IsNullOrEmpty(value))
+                    {
+                        scopes.Add(value);
+                    }
+                }
+                return scopes.Count > 0 ? string.Join(",", scopes) : null;
+            }
+
+            var text = token.ToString();
+            return string.IsNullOrWhiteSpace(text) ? null : text;
+        }
+
+        private string BuildSecretFingerprint(string secret)
+        {
+            if (string.IsNullOrEmpty(secret))
+            {
+                return "(missing)";
+            }
+
+            if (secret.Length <= 8)
+            {
+                return $"{secret[0]}***{secret[secret.Length - 1]}";
+            }
+
+            return $"{secret.Substring(0, 4)}...{secret.Substring(secret.Length - 4)}";
+        }
+
+        private float ReadTokenAsFloat(JToken token, float fallback)
+        {
+            if (token == null)
+            {
+                return fallback;
+            }
+
+            try
+            {
+                var direct = token.Value<float?>();
+                if (direct.HasValue)
+                {
+                    return direct.Value;
+                }
+            }
+            catch { }
+
+            var text = token.ToString();
+            if (float.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var parsed))
+            {
+                return parsed;
+            }
+
+            return fallback;
+        }
+
+        private bool ReadTokenAsBool(JToken token, bool fallback)
+        {
+            if (token == null)
+            {
+                return fallback;
+            }
+
+            try
+            {
+                var direct = token.Value<bool?>();
+                if (direct.HasValue)
+                {
+                    return direct.Value;
+                }
+            }
+            catch { }
+
+            var text = token.ToString();
+            if (bool.TryParse(text, out var parsed))
+            {
+                return parsed;
+            }
+
+            return fallback;
+        }
+
+        private void FireAndForget(Task task, string operationName)
+        {
+            task.ContinueWith(t =>
+            {
+                if (t.Exception != null)
+                {
+                    PrintError($"{operationName} failed: {t.Exception.Flatten().InnerException?.Message ?? t.Exception.Message}");
+                }
+            }, TaskContinuationOptions.OnlyOnFaulted);
+        }
+
+        private void LogVerbose(string message)
+        {
+            if (!VerboseLogging)
+            {
+                return;
+            }
+
+            Puts($"[Verbose] {message}");
+        }
+
+        private void ValidateConfig()
+        {
+            if (_config == null)
+            {
+                return;
+            }
+
+            if (_config.SessionRules == null)
+            {
+                _config.SessionRules = new SessionRulesConfig();
+            }
+
+            if (_config.RetryPolicy == null)
+            {
+                _config.RetryPolicy = new RetryPolicyConfig();
+            }
+
+            if (_config.RetryPolicy.Default == null)
+            {
+                _config.RetryPolicy.Default = new RetrySourcePolicyConfig
+                {
+                    MaxAttempts = 25,
+                    MaxDurationSeconds = 60,
+                    RetryIntervalSeconds = 2.4f
+                };
+            }
+
+            if (_config.RetryPolicy.Twitch == null)
+            {
+                _config.RetryPolicy.Twitch = new RetrySourcePolicyConfig
+                {
+                    MaxAttempts = 25,
+                    MaxDurationSeconds = 60,
+                    RetryIntervalSeconds = 2.4f
+                };
+            }
+
+            if (_config.RetryPolicy.Tiktok == null)
+            {
+                _config.RetryPolicy.Tiktok = new RetrySourcePolicyConfig
+                {
+                    MaxAttempts = 250,
+                    MaxDurationSeconds = 300,
+                    RetryIntervalSeconds = 1.2f
+                };
+            }
+
+            if (string.IsNullOrWhiteSpace(_config.AppId) || _config.AppId == "INSERT_APP_ID")
+            {
+                PrintWarning("Set app_id in CrowdControl.json before using auth flow.");
+            }
+
+            if (string.IsNullOrWhiteSpace(_config.AppSecret) || _config.AppSecret == "INSERT_APP_SECRET")
+            {
+                PrintWarning("Set app_secret in CrowdControl.json before using auth flow.");
+            }
+        }
+
+        protected override void LoadDefaultConfig()
+        {
+            _config = new PluginConfig();
+            SaveConfig();
+        }
+
+        protected override void LoadConfig()
+        {
+            base.LoadConfig();
+            try
+            {
+                _config = Config.ReadObject<PluginConfig>();
+                if (_config == null)
+                {
+                    throw new Exception("Config deserialized null.");
+                }
+
+                if (_config.SessionRules == null)
+                {
+                    _config.SessionRules = new SessionRulesConfig();
+                }
+            }
+            catch (Exception ex)
+            {
+                PrintError($"Config load failed, using defaults: {ex.Message}");
+                LoadDefaultConfig();
+            }
+        }
+
+        protected override void SaveConfig()
+        {
+            Config.WriteObject(_config, true);
+        }
+
+        private void SaveData()
+        {
+            Interface.Oxide.DataFileSystem.WriteObject(Name, _data);
+        }
+
+        private async Task RefreshSessionsAfterReloadAsync()
+        {
+            if (_data?.PlayerSessions == null || _data.PlayerSessions.Count == 0)
+            {
+                return;
+            }
+
+            var refreshed = 0;
+            var snapshot = new List<KeyValuePair<string, PlayerSessionState>>(_data.PlayerSessions);
+            foreach (var kvp in snapshot)
+            {
+                var session = kvp.Value;
+                if (session == null || string.IsNullOrEmpty(session.Token))
+                {
+                    continue;
+                }
+
+                if (!IsSteamPlayerOnline(kvp.Key))
+                {
+                    if (!string.IsNullOrEmpty(session.GameSessionId))
+                    {
+                        await StopGameSessionAsync(session);
+                    }
+                    continue;
+                }
+
+                // Force a clean session cycle on plugin init so old lingering sessions
+                // from previous plugin instances do not keep receiving effect requests.
+                await StopGameSessionAsync(session);
+                await StartGameSessionAsync(session, kvp.Key);
+                refreshed++;
+            }
+
+            if (refreshed > 0)
+            {
+                Puts($"Reload refresh completed for {refreshed} Crowd Control session(s).");
+            }
+        }
+
+        private async Task ApplySessionRulesAsync()
+        {
+            var currentSignature = GetSessionRulesSignature();
+            var previousSignature = _data?.SessionRulesSignature ?? string.Empty;
+
+            if (string.Equals(currentSignature, previousSignature, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _data.SessionRulesSignature = currentSignature;
+            SaveData();
+
+            if (string.IsNullOrEmpty(previousSignature))
+            {
+                LogVerbose("Stored initial session rules signature.");
+                return;
+            }
+
+            var restarted = 0;
+            foreach (var kvp in _data.PlayerSessions)
+            {
+                var steamId = kvp.Key;
+                var session = kvp.Value;
+                if (session == null || string.IsNullOrEmpty(session.Token))
+                {
+                    continue;
+                }
+
+                if (!IsSteamPlayerOnline(steamId))
+                {
+                    continue;
+                }
+
+                await RestartGameSessionAsync(session, steamId);
+                restarted++;
+            }
+
+            Puts($"Session rules changed; restarted {restarted} Crowd Control session(s).");
+        }
+
+        private string GetSessionRulesSignature()
+        {
+            var rules = _config?.SessionRules ?? new SessionRulesConfig();
+            return string.Join("|",
+                rules.EnableIntegrationTriggers ? "1" : "0",
+                rules.EnablePriceChange ? "1" : "0",
+                rules.DisableTestEffects ? "1" : "0",
+                rules.DisableCustomEffectsSync ? "1" : "0");
+        }
+
+        private bool IsEffectBlockedBySessionRules(JObject payload, JObject effect, out string reason)
+        {
+            reason = string.Empty;
+            var rules = _config?.SessionRules;
+            if (rules == null)
+            {
+                return false;
+            }
+
+            if (!rules.EnableIntegrationTriggers && IsIntegrationTriggeredRequest(payload, effect))
+            {
+                reason = "Integration-triggered effects are currently disabled by server settings.";
+                return true;
+            }
+
+            if (!rules.EnablePriceChange && IsPriceChangeRequest(payload, effect))
+            {
+                reason = "Price-change effects are currently disabled by server settings.";
+                return true;
+            }
+
+            if (rules.DisableTestEffects && IsTestEffectRequest(payload, effect))
+            {
+                reason = "Test effects are currently disabled by server settings.";
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool IsIntegrationTriggeredRequest(JObject payload, JObject effect)
+        {
+            var joined = BuildSearchableJsonText(payload, effect);
+            return ContainsAny(joined, "tiktok", "twitch", "pulsoid", "gift", "reward", "integration");
+        }
+
+        private bool IsPriceChangeRequest(JObject payload, JObject effect)
+        {
+            if ((payload?.Value<bool?>("priceChanged") ?? false) || (effect?.Value<bool?>("priceChanged") ?? false))
+            {
+                return true;
+            }
+
+            var requestedPrice = effect?.Value<int?>("price") ?? payload?.Value<int?>("price");
+            var basePrice = effect?.Value<int?>("defaultPrice") ??
+                            effect?.Value<int?>("menuPrice") ??
+                            payload?.Value<int?>("defaultPrice") ??
+                            payload?.Value<int?>("menuPrice");
+            if (requestedPrice.HasValue && basePrice.HasValue && requestedPrice.Value != basePrice.Value)
+            {
+                return true;
+            }
+
+            var joined = BuildSearchableJsonText(payload, effect);
+            return ContainsAny(joined, "pricechange", "price_changed", "price changed", "overrideprice");
+        }
+
+        private bool IsTestEffectRequest(JObject payload, JObject effect)
+        {
+            if ((payload?.Value<bool?>("isTest") ?? false) ||
+                (effect?.Value<bool?>("isTest") ?? false))
+            {
+                return true;
+            }
+
+            var requesterCcUid = payload?["requester"]?["ccUID"]?.ToString() ??
+                                 payload?["requester"]?["ccUid"]?.ToString() ??
+                                 string.Empty;
+            var targetCcUid = payload?["target"]?["ccUID"]?.ToString() ??
+                              payload?["target"]?["ccUid"]?.ToString() ??
+                              string.Empty;
+            return !string.IsNullOrWhiteSpace(requesterCcUid) &&
+                   !string.IsNullOrWhiteSpace(targetCcUid) &&
+                   string.Equals(requesterCcUid, targetCcUid, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private string BuildSearchableJsonText(params JToken[] tokens)
+        {
+            var parts = new List<string>();
+            foreach (var token in tokens)
+            {
+                if (token == null)
+                {
+                    continue;
+                }
+
+                var text = token.ToString(Formatting.None);
+                if (!string.IsNullOrEmpty(text))
+                {
+                    parts.Add(text);
+                }
+            }
+
+            return string.Join(" ", parts).ToLowerInvariant();
+        }
+
+        private bool ContainsAny(string haystack, params string[] needles)
+        {
+            if (string.IsNullOrEmpty(haystack) || needles == null)
+            {
+                return false;
+            }
+
+            foreach (var needle in needles)
+            {
+                if (string.IsNullOrEmpty(needle))
+                {
+                    continue;
+                }
+
+                if (haystack.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private void ShowEffectUi(BasePlayer player, string title, string message)
+        {
+            if (player == null || !player.IsConnected)
+            {
+                return;
+            }
+
+            var toastText = string.IsNullOrWhiteSpace(title)
+                ? message
+                : $"{title}: {message}";
+            SendToast(player, 0, toastText);
+        }
+
+        private void ShowErrorUi(BasePlayer player, string message)
+        {
+            if (player == null || !player.IsConnected || string.IsNullOrWhiteSpace(message))
+            {
+                return;
+            }
+
+            SendToast(player, 1, message);
+        }
+
+        private void SendToast(BasePlayer player, int style, string text)
+        {
+            if (player == null || !player.IsConnected || string.IsNullOrWhiteSpace(text))
+            {
+                return;
+            }
+
+            player.SendConsoleCommand("gametip.showtoast", style, text);
+        }
+
+        private void ShowSessionDisconnectToastToActivePlayers(string message)
+        {
+            if (_isUnloading || string.IsNullOrWhiteSpace(message))
+            {
+                return;
+            }
+
+            if (DateTime.UtcNow - _lastSessionDisconnectToastUtc < TimeSpan.FromSeconds(15))
+            {
+                return;
+            }
+
+            _lastSessionDisconnectToastUtc = DateTime.UtcNow;
+            foreach (var kvp in _data.PlayerSessions)
+            {
+                var session = kvp.Value;
+                if (session == null || string.IsNullOrEmpty(session.Token))
+                {
+                    continue;
+                }
+
+                var player = FindPlayerBySteamId(kvp.Key);
+                if (player == null || !player.IsConnected)
+                {
+                    continue;
+                }
+
+                ShowErrorUi(player, message);
+            }
+        }
+
+        private bool IsBuiltInEffectsPluginLoaded()
+        {
+            return plugins.Find(BuiltInEffectsPluginName) != null;
+        }
+
+        private void WarnIfBuiltInEffectsPluginMissing(string context, BasePlayer player = null, bool showWarning = true)
+        {
+            if (IsBuiltInEffectsPluginLoaded())
+            {
+                return;
+            }
+
+            var warning = $"CrowdControlEffects is not loaded during {context}; built-in Rust effects will be unavailable until that plugin loads.";
+            if (showWarning)
+            {
+                PrintWarning(warning);
+            }
+            else
+            {
+                Puts(warning);
+            }
+            if (player != null && player.IsConnected)
+            {
+                ShowErrorUi(player, "CrowdControlEffects is not loaded. Built-in Rust effects are currently unavailable.");
+            }
+        }
+
+        #endregion
+    }
+}
