@@ -933,8 +933,9 @@ namespace Oxide.Plugins
             var target = candidates[UnityEngine.Random.Range(0, candidates.Count)];
             var sourcePos = player.transform.position;
             var targetPos = target.transform.position;
-            player.Teleport(targetPos + new Vector3(0f, 0f, 1.5f));
-            target.Teleport(sourcePos + new Vector3(0f, 0f, 1.5f));
+            var verticalOffset = new Vector3(0f, 0.35f, 0f);
+            player.Teleport(targetPos + verticalOffset);
+            target.Teleport(sourcePos + verticalOffset);
             return true;
         }
 
@@ -1948,9 +1949,13 @@ namespace Oxide.Plugins
                 case "vehicle_truck":
                     return TrySpawnModularCarByShortnameAtPlayer(player, "3module_car_spawned", 10f, 1.5f, "Truck spawned.", 100, 2, out error);
                 case "rowboat":
+                    forwardDistance = 12f;
+                    upOffset = 0.9f;
+                    fuelAmount = 100;
+                    break;
                 case "rhib":
                     forwardDistance = 12f;
-                    upOffset = 0.5f;
+                    upOffset = 0.9f;
                     fuelAmount = 100;
                     break;
                 case "scraptransporthelicopter":
@@ -2125,7 +2130,13 @@ namespace Oxide.Plugins
 
         private bool TrySpawnModularCarByShortnameAtPlayer(BasePlayer player, string shortName, float forwardDistance, float upOffset, string successMessage, int fuelAmount, int engineKits, out string error)
         {
-            if (!TrySpawnByShortnameAtPlayer(player, shortName, forwardDistance, upOffset, successMessage, fuelAmount, out error))
+            error = string.Empty;
+            if (!TryResolveVehicleSpawnPosition(player, forwardDistance, out var basePosition, out error))
+            {
+                return false;
+            }
+
+            if (!TrySpawnByShortnameAtPosition(player, shortName, basePosition, upOffset, successMessage, fuelAmount, out error))
             {
                 return false;
             }
@@ -2171,6 +2182,12 @@ namespace Oxide.Plugins
                 return false;
             }
 
+            return TrySpawnByShortnameAtPosition(player, shortName, basePosition, upOffset, successMessage, fuelAmount, out error);
+        }
+
+        private bool TrySpawnByShortnameAtPosition(BasePlayer player, string shortName, Vector3 basePosition, float upOffset, string successMessage, int fuelAmount, out string error)
+        {
+            error = string.Empty;
             var position = basePosition + new Vector3(0f, upOffset, 0f);
             try
             {
@@ -2616,6 +2633,308 @@ namespace Oxide.Plugins
             }
 
             error = "Unable to spawn at current location. Try again.";
+            return false;
+        }
+
+        private bool TryResolveVehicleSpawnPosition(BasePlayer player, float preferredDistance, out Vector3 spawnPosition, out string error)
+        {
+            spawnPosition = Vector3.zero;
+            error = string.Empty;
+            if (!TryResolveGroundSpawnPosition(player, preferredDistance, out var candidate, out error))
+            {
+                return false;
+            }
+
+            if (IsNearStructure(candidate, 4f))
+            {
+                error = "Cannot spawn vehicles inside or too close to player-built structures.";
+                return false;
+            }
+
+            if (Physics.OverlapSphere(candidate + Vector3.up * 0.75f, 2.5f).Length > 12)
+            {
+                error = "Not enough clear space to spawn a vehicle here.";
+                return false;
+            }
+
+            spawnPosition = candidate;
+            return true;
+        }
+
+        private bool TryResolveWaterSpawnPosition(BasePlayer player, float preferredDistance, out Vector3 spawnPosition, out string error)
+        {
+            spawnPosition = Vector3.zero;
+            error = string.Empty;
+            if (player == null || !player.IsConnected)
+            {
+                error = "Unable to find water near the player.";
+                return false;
+            }
+
+            var center = player.transform.position;
+            var preferredRadius = Mathf.Clamp(preferredDistance, 8f, 18f);
+            var anchor = center;
+            var forward = player.eyes != null ? player.eyes.HeadForward() : player.transform.forward;
+            forward.y = 0f;
+            if (forward.sqrMagnitude < 0.001f)
+            {
+                forward = player.transform.forward;
+                forward.y = 0f;
+            }
+
+            if (forward.sqrMagnitude > 0.001f)
+            {
+                forward.Normalize();
+                anchor = center + (forward * preferredRadius);
+
+                if (player.eyes != null && Physics.Raycast(player.eyes.position, forward, out var lookHit, 40f))
+                {
+                    var lookDistance = Vector3.Distance(center, lookHit.point);
+                    if (lookDistance >= 6f)
+                    {
+                        anchor = center + (forward * Mathf.Clamp(lookDistance, 6f, 26f));
+                    }
+                }
+            }
+            else
+            {
+                forward = Vector3.forward;
+            }
+
+            if (IsPlayerInOrVeryNearWater(player))
+            {
+                var closeRadii = new[] { 6f, 8f, 10f, 12f, 14f };
+                var closeAngleOffsets = new[] { 0f, 20f, -20f, 40f, -40f, 60f, -60f, 90f, -90f, 120f, -120f, 160f, -160f, 180f };
+                foreach (var radius in closeRadii)
+                {
+                    for (var i = 0; i < closeAngleOffsets.Length; i++)
+                    {
+                        var direction = Quaternion.Euler(0f, closeAngleOffsets[i], 0f) * forward;
+                        var probe = center + (direction * radius);
+                        if (!TryScoreBoatSpawnCandidate(player, center, anchor, forward, preferredRadius, probe, out var candidate, out _))
+                        {
+                            continue;
+                        }
+
+                        spawnPosition = candidate;
+                        return true;
+                    }
+                }
+            }
+
+            foreach (var probe in EnumeratePreferredWaterProbes(center, anchor))
+            {
+                if (!TryScoreBoatSpawnCandidate(player, center, anchor, forward, preferredRadius, probe, out var candidate, out _))
+                {
+                    continue;
+                }
+
+                // Preferred probes are yielded in look-priority order, so accept the first good hit.
+                spawnPosition = candidate;
+                return true;
+            }
+
+            var searchRadii = new[] { 8f, 10f, 12f, 14f, 16f, 18f, 20f, 22f, 24f, 26f, 28f, 30f };
+            var forwardAngleOffsets = new[] { 0f, 12f, -12f, 24f, -24f, 36f, -36f, 48f, -48f, 60f, -60f, 75f, -75f, 90f, -90f };
+            foreach (var radius in searchRadii)
+            {
+                for (var i = 0; i < forwardAngleOffsets.Length; i++)
+                {
+                    var direction = Quaternion.Euler(0f, forwardAngleOffsets[i], 0f) * forward;
+                    var probe = center + (direction * radius);
+                    if (!TryScoreBoatSpawnCandidate(player, center, anchor, forward, preferredRadius, probe, out var candidate, out _))
+                    {
+                        continue;
+                    }
+
+                    spawnPosition = candidate;
+                    return true;
+                }
+            }
+
+            error = "You must be near open water to spawn a boat.";
+            return false;
+        }
+
+        private IEnumerable<Vector3> EnumeratePreferredWaterProbes(Vector3 center, Vector3 anchor)
+        {
+            yield return anchor;
+
+            var forward = anchor - center;
+            forward.y = 0f;
+            if (forward.sqrMagnitude < 0.001f)
+            {
+                forward = Vector3.forward;
+            }
+
+            forward.Normalize();
+            var right = Vector3.Cross(Vector3.up, forward).normalized;
+            var forwardOffsets = new[] { 0f, 2f, 4f, 6f, 8f, 10f, -2f, -4f };
+            var lateralOffsets = new[] { 0f, 1.5f, -1.5f, 3f, -3f, 4.5f, -4.5f, 6f, -6f };
+            for (var i = 0; i < forwardOffsets.Length; i++)
+            {
+                for (var j = 0; j < lateralOffsets.Length; j++)
+                {
+                    if (forwardOffsets[i] == 0f && lateralOffsets[j] == 0f)
+                    {
+                        continue;
+                    }
+
+                    yield return anchor + (forward * forwardOffsets[i]) + (right * lateralOffsets[j]);
+                }
+            }
+        }
+
+        private bool TryScoreBoatSpawnCandidate(BasePlayer player, Vector3 center, Vector3 anchor, Vector3 forward, float preferredRadius, Vector3 probe, out Vector3 candidate, out float score)
+        {
+            candidate = Vector3.zero;
+            score = 0f;
+            if (!TryGetWaterSurfaceY(probe, out var waterY))
+            {
+                return false;
+            }
+
+            candidate = new Vector3(probe.x, waterY, probe.z);
+            var candidateDistance = Vector3.Distance(center, candidate);
+            if (candidateDistance < 4f || candidateDistance > 32f)
+            {
+                return false;
+            }
+
+            if (IsNearStructure(candidate, 3f))
+            {
+                return false;
+            }
+
+            var toCandidate = candidate - center;
+            toCandidate.y = 0f;
+            if (toCandidate.sqrMagnitude > 0.001f)
+            {
+                toCandidate.Normalize();
+                var facingDot = Vector3.Dot(forward, toCandidate);
+                score += Mathf.Max(-0.5f, facingDot) * 30f;
+            }
+
+            var waterDepth = 0.35f;
+            if (TryResolveSpawnGroundY(player, probe, out var groundY))
+            {
+                waterDepth = waterY - groundY;
+                if (waterDepth < 0.15f)
+                {
+                    return false;
+                }
+            }
+
+            var nearbyWaterSupport = CountNearbyWaterNeighbors(candidate, waterY);
+            if (nearbyWaterSupport < 2)
+            {
+                return false;
+            }
+
+            var anchorDistance = Vector3.Distance(anchor, candidate);
+            var depthScore = Mathf.Clamp(waterDepth, 0.15f, 3f) * 12f;
+            var supportScore = nearbyWaterSupport * 10f;
+            var anchorScore = 22f - Mathf.Min(22f, anchorDistance);
+            var radiusScore = 18f - Mathf.Abs(candidateDistance - preferredRadius);
+            score = depthScore + supportScore + anchorScore + radiusScore;
+            return true;
+        }
+
+        private int CountNearbyWaterNeighbors(Vector3 candidate, float waterY)
+        {
+            var supports = 0;
+            foreach (var offset in new[]
+            {
+                new Vector3(2f, 0f, 0f),
+                new Vector3(-2f, 0f, 0f),
+                new Vector3(0f, 0f, 2f),
+                new Vector3(0f, 0f, -2f),
+                new Vector3(1.5f, 0f, 1.5f),
+                new Vector3(-1.5f, 0f, 1.5f),
+                new Vector3(1.5f, 0f, -1.5f),
+                new Vector3(-1.5f, 0f, -1.5f)
+            })
+            {
+                if (!TryGetWaterSurfaceY(candidate + offset, out var nearbyWaterY))
+                {
+                    continue;
+                }
+
+                if (Mathf.Abs(nearbyWaterY - waterY) <= 1.5f)
+                {
+                    supports++;
+                }
+            }
+
+            return supports;
+        }
+
+        private bool IsPlayerInOrVeryNearWater(BasePlayer player)
+        {
+            if (player == null)
+            {
+                return false;
+            }
+
+            var modelState = GetMemberObject(player, "modelState");
+            if (TryGetBoolMember(modelState, "swimming", out var swimming) && swimming)
+            {
+                return true;
+            }
+
+            var position = player.transform.position;
+            if (!TryGetWaterSurfaceY(position, out var waterY))
+            {
+                return false;
+            }
+
+            if (!TryResolveSpawnGroundY(player, position, out var groundY))
+            {
+                return Mathf.Abs(waterY - position.y) <= 1.5f;
+            }
+
+            return (waterY - groundY) >= 0.2f && Mathf.Abs(waterY - position.y) <= 2f;
+        }
+
+        private bool TryGetWaterSurfaceY(Vector3 position, out float waterY)
+        {
+            waterY = 0f;
+            try
+            {
+                var flags = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+                var waterMap = typeof(TerrainMeta).GetProperty("WaterMap", flags)?.GetValue(null, null) ??
+                    typeof(TerrainMeta).GetField("WaterMap", flags)?.GetValue(null);
+                if (waterMap == null)
+                {
+                    return false;
+                }
+
+                foreach (var methodName in new[] { "GetHeight", "GetHeightFast" })
+                {
+                    var method = waterMap.GetType().GetMethod(methodName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(Vector3) }, null);
+                    if (method == null)
+                    {
+                        continue;
+                    }
+
+                    var value = method.Invoke(waterMap, new object[] { position });
+                    if (value is float directFloat)
+                    {
+                        waterY = directFloat;
+                        return waterY > -1000f;
+                    }
+
+                    if (value is double directDouble)
+                    {
+                        waterY = (float)directDouble;
+                        return waterY > -1000f;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
             return false;
         }
 

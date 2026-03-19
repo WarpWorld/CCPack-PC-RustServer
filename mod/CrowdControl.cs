@@ -57,6 +57,8 @@ namespace Oxide.Plugins
         private readonly SemaphoreSlim _sendSemaphore = new SemaphoreSlim(1, 1);
         private readonly Queue<string> _pendingAuthRequests = new Queue<string>();
         private readonly Dictionary<string, string> _authCodeToSteamId = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, ActiveAuthCodeState> _activeAuthCodesBySteamId = new Dictionary<string, ActiveAuthCodeState>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, CommandReplyMode> _authReplyModeBySteamId = new Dictionary<string, CommandReplyMode>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _sessionStartInProgress = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> _lastCustomEffectsSyncUtc = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> _recentHandledRequestIds = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
@@ -231,6 +233,18 @@ namespace Oxide.Plugins
             public string SteamId;
             public string Token;
             public Oxide.Plugins.Timer TimeoutTimer;
+        }
+
+        private enum CommandReplyMode
+        {
+            Chat,
+            Console
+        }
+
+        private sealed class ActiveAuthCodeState
+        {
+            public string Code;
+            public DateTime ExpiresUtc;
         }
 
         private sealed class StoredData
@@ -519,13 +533,13 @@ namespace Oxide.Plugins
         [ChatCommand("cc")]
         private void CommandCrowdControl(BasePlayer player, string command, string[] args)
         {
-            HandleCrowdControlCommand(player, args);
+            HandleCrowdControlCommand(player, args, CommandReplyMode.Chat);
         }
 
         [ChatCommand("crowdcontrol")]
         private void CommandCrowdControlLong(BasePlayer player, string command, string[] args)
         {
-            HandleCrowdControlCommand(player, args);
+            HandleCrowdControlCommand(player, args, CommandReplyMode.Chat);
         }
 
         [ConsoleCommand("cc")]
@@ -548,10 +562,10 @@ namespace Oxide.Plugins
                 return;
             }
 
-            HandleCrowdControlCommand(player, arg.Args ?? Array.Empty<string>());
+            HandleCrowdControlCommand(player, arg.Args ?? Array.Empty<string>(), CommandReplyMode.Console);
         }
 
-        private void HandleCrowdControlCommand(BasePlayer player, string[] args)
+        private void HandleCrowdControlCommand(BasePlayer player, string[] args, CommandReplyMode replyMode)
         {
             if (player == null)
             {
@@ -560,23 +574,23 @@ namespace Oxide.Plugins
 
             if (args.Length == 0)
             {
-                if (!CanUsePlugin(player))
+                if (!CanUsePlugin(player, replyMode))
                 {
                     return;
                 }
 
-                SendHelp(player);
+                SendHelp(player, replyMode);
                 return;
             }
 
             var sub = args[0].ToLowerInvariant();
             if (string.Equals(sub, "reload", StringComparison.Ordinal))
             {
-                HandleReloadCommand(player);
+                HandleReloadCommand(player, replyMode);
                 return;
             }
 
-            if (!CanUsePlugin(player))
+            if (!CanUsePlugin(player, replyMode))
             {
                 return;
             }
@@ -584,51 +598,79 @@ namespace Oxide.Plugins
             switch (sub)
             {
                 case "help":
-                    SendHelp(player);
+                    SendHelp(player, replyMode);
                     break;
                 case "link":
                 case "auth":
-                    HandleAuthCommand(player);
+                    HandleAuthCommand(player, replyMode);
                     break;
                 case "unlink":
-                    HandleLogoutCommand(player);
+                    HandleLogoutCommand(player, replyMode);
                     break;
                 case "status":
-                    HandleStatusCommand(player);
+                    HandleStatusCommand(player, replyMode);
                     break;
                 case "settings":
-                    HandleSettingsCommand(player);
+                    HandleSettingsCommand(player, replyMode);
                     break;
                 case "restart":
-                    HandleRestartSessionCommand(player);
+                    HandleRestartSessionCommand(player, replyMode);
                     break;
                 case "logout":
-                    HandleLogoutCommand(player);
+                    HandleLogoutCommand(player, replyMode);
                     break;
                 default:
-                    SendHelp(player);
+                    SendHelp(player, replyMode);
                     break;
             }
         }
 
-        private void SendHelp(BasePlayer player)
+        private void SendHelp(BasePlayer player, CommandReplyMode replyMode)
         {
-            player.ConsoleMessage("[CrowdControl] Commands:");
-            player.ConsoleMessage("[CrowdControl] /crowdcontrol link - Link your Crowd Control account");
-            player.ConsoleMessage("[CrowdControl] /crowdcontrol unlink - Unlink your Crowd Control account");
-            player.ConsoleMessage("[CrowdControl] /crowdcontrol status - Show auth/session status");
-            player.ConsoleMessage("[CrowdControl] /crowdcontrol settings - Show current server Crowd Control settings");
-            player.ConsoleMessage($"[CrowdControl] /crowdcontrol reload - Reload Crowd Control config/data and refresh sessions ({PermAdmin})");
-            player.ConsoleMessage("[CrowdControl] /crowdcontrol restart - Restart game session using saved token");
-            player.ConsoleMessage("[CrowdControl] Console usage: crowdcontrol <link|unlink|status|settings|restart|reload>");
-            player.ConsoleMessage($"[CrowdControl] Auth/enforcement bypass permission: {PermIgnore}");
-            player.ConsoleMessage("[CrowdControl] Alias: /cc <same_subcommand>");
-            ShowEffectUi(player, "Crowd Control", "Help sent to F1 console.");
+            if (replyMode == CommandReplyMode.Console)
+            {
+                SendCommandReplies(
+                    player,
+                    replyMode,
+                    "Commands:",
+                    "Console commands use no leading slash.",
+                    "cc link - Link your Crowd Control account",
+                    "cc unlink - Unlink your Crowd Control account",
+                    "cc status - Show connection status and plugin version",
+                    "cc settings - Show current server Crowd Control settings",
+                    $"cc reload - Reload Crowd Control config/data and refresh sessions ({PermAdmin})",
+                    "cc restart - Restart game session using saved token",
+                    "Alias: crowdcontrol <same_subcommand>",
+                    $"Auth/enforcement bypass permission: {PermIgnore}",
+                    "Chat commands still use /cc <same_subcommand>."
+                );
+                return;
+            }
+
+            SendCommandReplies(
+                player,
+                replyMode,
+                "Commands:",
+                "/cc link - Link your Crowd Control account",
+                "/cc unlink - Unlink your Crowd Control account",
+                "/cc status - Show connection status and plugin version",
+                "/cc settings - Show current server Crowd Control settings",
+                $"/cc reload - Reload Crowd Control config/data and refresh sessions ({PermAdmin})",
+                "/cc restart - Restart game session using saved token",
+                "Console aliases are cc <same_subcommand> and crowdcontrol <same_subcommand>.",
+                $"Auth/enforcement bypass permission: {PermIgnore}"
+            );
         }
 
-        private void HandleAuthCommand(BasePlayer player)
+        private void HandleAuthCommand(BasePlayer player, CommandReplyMode replyMode)
         {
-            if (!CanUsePlugin(player))
+            var authReplyMode = CommandReplyMode.Console;
+            var requestedFromChat = replyMode == CommandReplyMode.Chat;
+            string existingCode = null;
+            var alreadyPending = false;
+            var queueFull = false;
+
+            if (!CanUsePlugin(player, authReplyMode))
             {
                 return;
             }
@@ -636,51 +678,90 @@ namespace Oxide.Plugins
             if (_data.PlayerSessions.TryGetValue(player.UserIDString, out var existingSession) &&
                 !string.IsNullOrEmpty(existingSession?.Token))
             {
-                ShowEffectUi(player, "Crowd Control", "You are already authenticated. Use /cc status, /cc restart, or /cc unlink first.");
+                SendCommandReply(
+                    player,
+                    authReplyMode,
+                    "You are already authenticated. Use cc status, cc restart, or cc unlink."
+                );
                 return;
             }
 
             lock (_pendingAuthRequests)
             {
-                if (_pendingAuthRequests.Contains(player.UserIDString))
+                if (TryGetActiveAuthCodeLocked(player.UserIDString, out existingCode))
                 {
-                    ShowEffectUi(player, "Crowd Control", "An auth code request is already pending for you. Check console (F1).");
-                    return;
+                }
+                else if (_pendingAuthRequests.Contains(player.UserIDString))
+                {
+                    alreadyPending = true;
+                }
+                else if (_pendingAuthRequests.Count >= MaxAuthQueue)
+                {
+                    queueFull = true;
+                }
+                else
+                {
+                    _pendingAuthRequests.Enqueue(player.UserIDString);
+                    _authReplyModeBySteamId[player.UserIDString] = authReplyMode;
                 }
             }
 
-            if (_pendingAuthRequests.Count >= MaxAuthQueue)
+            if (!string.IsNullOrWhiteSpace(existingCode))
             {
-                ShowEffectUi(player, "Crowd Control", "Auth queue is currently full. Try again shortly.");
+                SendCommandReply(player, authReplyMode, $"You already have an active auth code: {existingCode}");
+                SendCommandReply(player, authReplyMode, "You have 3 minutes to enter this code before it expires.");
+                if (requestedFromChat)
+                {
+                    SendCommandReply(player, CommandReplyMode.Chat, "You already have a valid Crowd Control code. Press F1 to view it in console.");
+                }
                 return;
             }
 
-            lock (_pendingAuthRequests)
+            if (alreadyPending)
             {
-                _pendingAuthRequests.Enqueue(player.UserIDString);
+                SendCommandReply(player, authReplyMode, "An auth code request is already pending for you.");
+                if (requestedFromChat)
+                {
+                    SendCommandReply(player, CommandReplyMode.Chat, "Auth is already in progress. Press F1 to watch for your code in console.");
+                }
+                return;
+            }
+
+            if (queueFull)
+            {
+                SendCommandReply(player, authReplyMode, "Auth queue is currently full. Try again shortly.");
+                if (requestedFromChat)
+                {
+                    SendCommandReply(player, CommandReplyMode.Chat, "Crowd Control auth queue is full right now. Try again shortly.");
+                }
+                return;
             }
 
             FireAndForget(EnsureSocketConnectedAsync(), "auth command socket ensure");
             FireAndForget(SendGenerateAuthCodeAsync(), "send generate auth code");
-            ShowEffectUi(player, "Crowd Control", "Check console (F1) for instructions.");
+            SendCommandReply(player, authReplyMode, "Auth code request submitted. Watch this console for your code.");
+            if (requestedFromChat)
+            {
+                SendCommandReply(player, CommandReplyMode.Chat, "Auth started. Press F1 to view your Crowd Control code in console.");
+            }
         }
 
-        private void HandleStatusCommand(BasePlayer player)
+        private void HandleStatusCommand(BasePlayer player, CommandReplyMode replyMode)
         {
-            if (!CanUsePlugin(player))
+            if (!CanUsePlugin(player, replyMode))
             {
                 return;
             }
 
             _data.PlayerSessions.TryGetValue(player.UserIDString, out var session);
             var isConnected = HasActiveGameSession(player.UserIDString, session);
-            ShowEffectUi(player, "Crowd Control", $"Status: {(isConnected ? "Connected" : "Not connected")}");
-            ShowEffectUi(player, "Crowd Control", $"Version: {Version}");
+            SendCommandReply(player, replyMode, $"Status: {(isConnected ? "Connected" : "Not connected")}");
+            SendCommandReply(player, replyMode, $"Version: {Version}");
         }
 
-        private void HandleSettingsCommand(BasePlayer player)
+        private void HandleSettingsCommand(BasePlayer player, CommandReplyMode replyMode)
         {
-            if (!CanUsePlugin(player))
+            if (!CanUsePlugin(player, replyMode))
             {
                 return;
             }
@@ -692,21 +773,24 @@ namespace Oxide.Plugins
             var retryTiktok = retry.Tiktok ?? retryDefault;
             var enforce = _config?.EnforceCrowdControl ?? new EnforceCrowdControlConfig();
 
-            player.ConsoleMessage("[CrowdControl] Active server settings:");
-            player.ConsoleMessage($"[CrowdControl] Access: {(_config?.AllowAllUsersWithoutPermission ?? true ? "all players may use Crowd Control" : $"permission required ({PermUse})")}");
-            player.ConsoleMessage($"[CrowdControl] Auth bypass permission: {PermIgnore}");
-            player.ConsoleMessage($"[CrowdControl] Session rules: integration triggers={(rules.EnableIntegrationTriggers ? "enabled" : "disabled")}, price changes={(rules.EnablePriceChange ? "enabled" : "disabled")}, test effects={(rules.DisableTestEffects ? "disabled" : "enabled")}, custom effect sync={(rules.DisableCustomEffectsSync ? "disabled" : "enabled")}");
-            player.ConsoleMessage($"[CrowdControl] Enforcement: {(enforce.Enabled ? "enabled" : "disabled")}, grace={Math.Max(30, enforce.EnforceTimeSeconds)}s, restrict movement={(enforce.RestrictMovement ? "enabled" : "disabled")}");
-            player.ConsoleMessage($"[CrowdControl] Retry policy: {(retry.Enabled ? "enabled" : "disabled")}");
-            player.ConsoleMessage($"[CrowdControl] Retry default: attempts={retryDefault.MaxAttempts}, duration={retryDefault.MaxDurationSeconds}s, interval={retryDefault.RetryIntervalSeconds:0.##}s");
-            player.ConsoleMessage($"[CrowdControl] Retry Twitch: attempts={retryTwitch.MaxAttempts}, duration={retryTwitch.MaxDurationSeconds}s, interval={retryTwitch.RetryIntervalSeconds:0.##}s");
-            player.ConsoleMessage($"[CrowdControl] Retry TikTok: attempts={retryTiktok.MaxAttempts}, duration={retryTiktok.MaxDurationSeconds}s, interval={retryTiktok.RetryIntervalSeconds:0.##}s");
-            ShowEffectUi(player, "Crowd Control", "Server settings sent to F1 console.");
+            SendCommandReplies(
+                player,
+                replyMode,
+                "Active server settings:",
+                $"Access: {(_config?.AllowAllUsersWithoutPermission ?? true ? "all players may use Crowd Control" : $"permission required ({PermUse})")}",
+                $"Auth bypass permission: {PermIgnore}",
+                $"Session rules: integration triggers={(rules.EnableIntegrationTriggers ? "enabled" : "disabled")}, price changes={(rules.EnablePriceChange ? "enabled" : "disabled")}, test effects={(rules.DisableTestEffects ? "disabled" : "enabled")}, custom effect sync={(rules.DisableCustomEffectsSync ? "disabled" : "enabled")}",
+                $"Enforcement: {(enforce.Enabled ? "enabled" : "disabled")}, grace={Math.Max(30, enforce.EnforceTimeSeconds)}s, restrict movement={(enforce.RestrictMovement ? "enabled" : "disabled")}",
+                $"Retry policy: {(retry.Enabled ? "enabled" : "disabled")}",
+                $"Retry default: attempts={retryDefault.MaxAttempts}, duration={retryDefault.MaxDurationSeconds}s, interval={retryDefault.RetryIntervalSeconds:0.##}s",
+                $"Retry Twitch: attempts={retryTwitch.MaxAttempts}, duration={retryTwitch.MaxDurationSeconds}s, interval={retryTwitch.RetryIntervalSeconds:0.##}s",
+                $"Retry TikTok: attempts={retryTiktok.MaxAttempts}, duration={retryTiktok.MaxDurationSeconds}s, interval={retryTiktok.RetryIntervalSeconds:0.##}s"
+            );
         }
 
-        private void HandleReloadCommand(BasePlayer player)
+        private void HandleReloadCommand(BasePlayer player, CommandReplyMode replyMode)
         {
-            if (!CanUseAdminCommand(player))
+            if (!CanUseAdminCommand(player, replyMode))
             {
                 return;
             }
@@ -721,36 +805,42 @@ namespace Oxide.Plugins
             FireAndForget(EnsureSocketConnectedAsync(), "admin reload socket ensure");
             NotifyCrowdControlProvidersSessionStateChanged();
             RefreshCrowdControlEnforcementForAllPlayers();
-            ShowEffectUi(player, "Crowd Control", "Reloaded config/data and refreshing Crowd Control sessions.");
+            SendCommandReply(player, replyMode, "Reloaded config/data and refreshing Crowd Control sessions.");
         }
 
-        private void HandleRestartSessionCommand(BasePlayer player)
+        private void HandleRestartSessionCommand(BasePlayer player, CommandReplyMode replyMode)
         {
-            if (!CanUsePlugin(player))
+            if (!CanUsePlugin(player, replyMode))
             {
                 return;
             }
 
             if (!_data.PlayerSessions.TryGetValue(player.UserIDString, out var session) || string.IsNullOrEmpty(session?.Token))
             {
-                ShowEffectUi(player, "Crowd Control", "No saved Crowd Control token. Run /cc link first.");
+                SendCommandReply(
+                    player,
+                    replyMode,
+                    replyMode == CommandReplyMode.Console
+                        ? "No saved Crowd Control token. Run cc link first."
+                        : "No saved Crowd Control token. Run /cc link first."
+                );
                 return;
             }
 
             FireAndForget(RestartGameSessionAsync(session, player.UserIDString), "manual session restart");
-            ShowEffectUi(player, "Crowd Control", "Restarting Crowd Control session...");
+            SendCommandReply(player, replyMode, "Restarting Crowd Control session...");
         }
 
-        private void HandleLogoutCommand(BasePlayer player)
+        private void HandleLogoutCommand(BasePlayer player, CommandReplyMode replyMode)
         {
-            if (!CanUsePlugin(player))
+            if (!CanUsePlugin(player, replyMode))
             {
                 return;
             }
 
             if (!_data.PlayerSessions.TryGetValue(player.UserIDString, out var session))
             {
-                ShowEffectUi(player, "Crowd Control", "No active auth state to clear.");
+                SendCommandReply(player, replyMode, "No active auth state to clear.");
                 return;
             }
 
@@ -759,7 +849,7 @@ namespace Oxide.Plugins
             SaveData();
             FireAndForget(EnsureSocketConnectedAsync(), "socket state check on logout");
             RefreshCrowdControlEnforcement(player);
-            ShowEffectUi(player, "Crowd Control", "Crowd Control credentials removed.");
+            SendCommandReply(player, replyMode, "Crowd Control credentials removed.");
         }
 
         #endregion
@@ -1605,7 +1695,142 @@ namespace Oxide.Plugins
 
         #region Access Control
 
-        private bool CanUsePlugin(BasePlayer player)
+        private void SendCommandReply(BasePlayer player, CommandReplyMode replyMode, string message)
+        {
+            if (player == null || string.IsNullOrWhiteSpace(message))
+            {
+                return;
+            }
+
+            if (replyMode == CommandReplyMode.Console)
+            {
+                player.ConsoleMessage($"[CrowdControl] {message}");
+                return;
+            }
+
+            player.ChatMessage($"[CrowdControl] {message}");
+        }
+
+        private void SendCommandReplies(BasePlayer player, CommandReplyMode replyMode, params string[] messages)
+        {
+            if (messages == null)
+            {
+                return;
+            }
+
+            for (var i = 0; i < messages.Length; i++)
+            {
+                SendCommandReply(player, replyMode, messages[i]);
+            }
+        }
+
+        private CommandReplyMode GetAuthReplyMode(string steamId)
+        {
+            lock (_pendingAuthRequests)
+            {
+                if (!string.IsNullOrWhiteSpace(steamId) && _authReplyModeBySteamId.TryGetValue(steamId, out var replyMode))
+                {
+                    return replyMode;
+                }
+            }
+
+            return CommandReplyMode.Console;
+        }
+
+        private bool TryGetActiveAuthCode(string steamId, out string code)
+        {
+            lock (_pendingAuthRequests)
+            {
+                return TryGetActiveAuthCodeLocked(steamId, out code);
+            }
+        }
+
+        private bool TryGetActiveAuthCodeLocked(string steamId, out string code)
+        {
+            code = null;
+            if (string.IsNullOrWhiteSpace(steamId) || !_activeAuthCodesBySteamId.TryGetValue(steamId, out var state) || state == null)
+            {
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(state.Code) || state.ExpiresUtc <= DateTime.UtcNow)
+            {
+                if (!string.IsNullOrWhiteSpace(state.Code))
+                {
+                    _authCodeToSteamId.Remove(state.Code);
+                }
+
+                _activeAuthCodesBySteamId.Remove(steamId);
+                return false;
+            }
+
+            code = state.Code;
+            return true;
+        }
+
+        private void SetActiveAuthCode(string steamId, string code, DateTime expiresUtc)
+        {
+            lock (_pendingAuthRequests)
+            {
+                if (string.IsNullOrWhiteSpace(steamId) || string.IsNullOrWhiteSpace(code))
+                {
+                    return;
+                }
+
+                if (_activeAuthCodesBySteamId.TryGetValue(steamId, out var existingState) && !string.IsNullOrWhiteSpace(existingState?.Code))
+                {
+                    _authCodeToSteamId.Remove(existingState.Code);
+                }
+
+                _activeAuthCodesBySteamId[steamId] = new ActiveAuthCodeState
+                {
+                    Code = code,
+                    ExpiresUtc = expiresUtc
+                };
+                _authCodeToSteamId[code] = steamId;
+            }
+        }
+
+        private void ClearActiveAuthCode(string steamId, string code = null)
+        {
+            lock (_pendingAuthRequests)
+            {
+                if (string.IsNullOrWhiteSpace(steamId))
+                {
+                    return;
+                }
+
+                if (_activeAuthCodesBySteamId.TryGetValue(steamId, out var state))
+                {
+                    if (string.IsNullOrWhiteSpace(code) || string.Equals(state?.Code, code, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!string.IsNullOrWhiteSpace(state?.Code))
+                        {
+                            _authCodeToSteamId.Remove(state.Code);
+                        }
+
+                        _activeAuthCodesBySteamId.Remove(steamId);
+                    }
+                }
+                else if (!string.IsNullOrWhiteSpace(code))
+                {
+                    _authCodeToSteamId.Remove(code);
+                }
+            }
+        }
+
+        private void ClearAuthReplyMode(string steamId)
+        {
+            lock (_pendingAuthRequests)
+            {
+                if (!string.IsNullOrWhiteSpace(steamId))
+                {
+                    _authReplyModeBySteamId.Remove(steamId);
+                }
+            }
+        }
+
+        private bool CanUsePlugin(BasePlayer player, CommandReplyMode? replyMode = null)
         {
             if (player == null)
             {
@@ -1614,14 +1839,22 @@ namespace Oxide.Plugins
 
             if (!IsPlayerAllowedForCrowdControl(player))
             {
-                ShowEffectUi(player, "Crowd Control", "You do not have permission to use Crowd Control.");
+                if (replyMode.HasValue)
+                {
+                    SendCommandReply(player, replyMode.Value, $"You do not have permission to use Crowd Control. Required permission: {PermUse}");
+                }
+                else
+                {
+                    ShowEffectUi(player, "Crowd Control", "You do not have permission to use Crowd Control.");
+                    player.ConsoleMessage($"[CrowdControl] You do not have permission to use Crowd Control. Required permission: {PermUse}");
+                }
                 return false;
             }
 
             return true;
         }
 
-        private bool CanUseAdminCommand(BasePlayer player)
+        private bool CanUseAdminCommand(BasePlayer player, CommandReplyMode? replyMode = null)
         {
             if (player == null)
             {
@@ -1630,7 +1863,14 @@ namespace Oxide.Plugins
 
             if (!permission.UserHasPermission(player.UserIDString, PermAdmin))
             {
-                ShowErrorUi(player, $"You need the {PermAdmin} permission to use this command.");
+                if (replyMode.HasValue)
+                {
+                    SendCommandReply(player, replyMode.Value, $"You need the {PermAdmin} permission to use this command.");
+                }
+                else
+                {
+                    ShowErrorUi(player, $"You need the {PermAdmin} permission to use this command.");
+                }
                 return false;
             }
 
@@ -1665,11 +1905,11 @@ namespace Oxide.Plugins
                 return;
             }
 
-            player.ChatMessage("Crowd Control is available on this server. Press F1 and type /cc link to connect.");
-            ShowEffectUi(player, "Crowd Control", "Press F1 and type /cc link to connect.");
+            player.ChatMessage("Crowd Control is available on this server. Type /cc link in chat or use cc link in F1 console to connect.");
+            ShowEffectUi(player, "Crowd Control", "Press F1 and type cc link to connect.");
             player.ConsoleMessage("[CrowdControl] Crowd Control is available on this server.");
-            player.ConsoleMessage("[CrowdControl] Press F1 and run: /cc link");
-            player.ConsoleMessage("[CrowdControl] Other useful commands: /cc status, /cc settings");
+            player.ConsoleMessage("[CrowdControl] Run: cc link");
+            player.ConsoleMessage("[CrowdControl] Other useful commands: cc status, cc settings");
 
             if (!_crowdControlEnforcementBySteamId.TryGetValue(player.UserIDString, out var state))
             {
@@ -1684,7 +1924,7 @@ namespace Oxide.Plugins
                 var current = FindPlayerBySteamId(player.UserIDString);
                 if (ShouldPromptCrowdControlLink(current))
                 {
-                    ShowEffectUi(current, "Crowd Control", "Reminder: press F1 and type /cc link to connect.");
+                    ShowEffectUi(current, "Crowd Control", "Reminder: press F1 and type cc link to connect.");
                 }
             });
         }
@@ -1756,9 +1996,9 @@ namespace Oxide.Plugins
 
             state.IsEnforced = true;
             state.AnchorPosition = player.transform.position;
-            ShowErrorUi(player, "Crowd Control linking is required. Press F1 and type /cc link now.");
+            ShowErrorUi(player, "Crowd Control linking is required. Press F1 and type cc link now.");
             player.ConsoleMessage("[CrowdControl] Crowd Control linking is required on this server.");
-            player.ConsoleMessage("[CrowdControl] Press F1 and run: /cc link");
+            player.ConsoleMessage("[CrowdControl] Run: cc link");
             TryClosePlayerInventory(player);
 
             if (_config?.EnforceCrowdControl?.RestrictMovement == true)
@@ -1819,7 +2059,7 @@ namespace Oxide.Plugins
             }
 
             state.LastBlockedNoticeUtc = DateTime.UtcNow;
-            ShowErrorUi(player, "Link Crowd Control with /cc link before playing.");
+            ShowErrorUi(player, "Link Crowd Control with cc link in F1 or /cc link in chat before playing.");
         }
 
         private bool IsPlayerAllowedForCrowdControl(BasePlayer player)
@@ -2038,11 +2278,16 @@ namespace Oxide.Plugins
         private void HandleApplicationAuthCode(JObject payload)
         {
             string steamId = null;
+            var replyMode = CommandReplyMode.Console;
             lock (_pendingAuthRequests)
             {
                 if (_pendingAuthRequests.Count > 0)
                 {
                     steamId = _pendingAuthRequests.Dequeue();
+                    if (!string.IsNullOrWhiteSpace(steamId) && _authReplyModeBySteamId.TryGetValue(steamId, out var queuedReplyMode))
+                    {
+                        replyMode = queuedReplyMode;
+                    }
                 }
             }
 
@@ -2056,7 +2301,7 @@ namespace Oxide.Plugins
 
             if (!string.IsNullOrEmpty(code))
             {
-                _authCodeToSteamId[code] = steamId;
+                SetActiveAuthCode(steamId, code, DateTime.UtcNow.AddMinutes(3));
             }
 
             var player = FindPlayerBySteamId(steamId);
@@ -2064,25 +2309,41 @@ namespace Oxide.Plugins
             {
                 if (!string.IsNullOrEmpty(code))
                 {
-                    player.ConsoleMessage($"[CrowdControl] Enter this auth code into your Crowd Control app: {code}");
-                    player.ConsoleMessage("[CrowdControl] You have 3 minutes to enter this code before it expires.");
-                    ShowEffectUi(player, "Crowd Control", "Check console (F1) for instructions.");
+                    SendCommandReply(player, replyMode, $"Enter this auth code into your Crowd Control app: {code}");
+                    SendCommandReply(player, replyMode, "You have 3 minutes to enter this code before it expires.");
                 }
                 else
                 {
-                    ShowEffectUi(player, "Crowd Control", "Auth code generation failed. Please run /cc link again.");
+                    SendCommandReply(
+                        player,
+                        replyMode,
+                        replyMode == CommandReplyMode.Console
+                            ? "Auth code generation failed. Please run cc link again."
+                            : "Auth code generation failed. Please run /cc link again."
+                    );
+                    ClearAuthReplyMode(steamId);
                 }
+            }
+
+            if (string.IsNullOrEmpty(code))
+            {
+                ClearAuthReplyMode(steamId);
             }
         }
 
         private void HandleApplicationAuthCodeError(JObject payload)
         {
             string steamId = null;
+            var replyMode = CommandReplyMode.Console;
             lock (_pendingAuthRequests)
             {
                 if (_pendingAuthRequests.Count > 0)
                 {
                     steamId = _pendingAuthRequests.Dequeue();
+                    if (!string.IsNullOrWhiteSpace(steamId) && _authReplyModeBySteamId.TryGetValue(steamId, out var queuedReplyMode))
+                    {
+                        replyMode = queuedReplyMode;
+                    }
                 }
             }
 
@@ -2092,8 +2353,10 @@ namespace Oxide.Plugins
             var player = !string.IsNullOrEmpty(steamId) ? FindPlayerBySteamId(steamId) : null;
             if (player != null)
             {
-                ShowEffectUi(player, "Crowd Control", $"Auth code failed: {message}");
+                SendCommandReply(player, replyMode, $"Auth code failed: {message}");
             }
+
+            ClearAuthReplyMode(steamId);
         }
 
         private void HandleApplicationAuthCodeRedeemed(JObject payload)
@@ -2110,7 +2373,7 @@ namespace Oxide.Plugins
                 return;
             }
 
-            _authCodeToSteamId.Remove(code);
+            ClearActiveAuthCode(steamId, code);
             FireAndForget(ExchangeAuthCodeForTokenAsync(steamId, code), "exchange auth code");
         }
 
@@ -2276,6 +2539,7 @@ namespace Oxide.Plugins
 
         private async Task ExchangeAuthCodeForTokenAsync(string steamId, string code)
         {
+            var replyMode = GetAuthReplyMode(steamId);
             try
             {
                 LogVerbose(
@@ -2326,8 +2590,8 @@ namespace Oxide.Plugins
                 var player = FindPlayerBySteamId(steamId);
                 if (player != null)
                 {
-                    ShowEffectUi(player, "Crowd Control", "Crowd Control auth complete.");
-                    ShowEffectUi(player, "Crowd Control", $"Connected profile: {decoded.Name} ({decoded.CcUid})");
+                    SendCommandReply(player, replyMode, "Crowd Control auth complete.");
+                    SendCommandReply(player, replyMode, $"Connected profile: {decoded.Name} ({decoded.CcUid})");
                 }
                 ClearCrowdControlEnforcement(steamId, showReleasedMessage: true);
                 WarnIfBuiltInEffectsPluginMissing("auth completion", player);
@@ -2347,6 +2611,16 @@ namespace Oxide.Plugins
             catch (Exception ex)
             {
                 PrintError($"Token exchange failed for {steamId}: {ex.Message}");
+                var player = FindPlayerBySteamId(steamId);
+                if (player != null)
+                {
+                    SendCommandReply(player, replyMode, $"Auth token exchange failed: {ex.Message}");
+                }
+            }
+            finally
+            {
+                ClearActiveAuthCode(steamId);
+                ClearAuthReplyMode(steamId);
             }
         }
 
@@ -2412,6 +2686,7 @@ namespace Oxide.Plugins
                 {
                     session.GameSessionId = gameSessionId;
                     SaveData();
+                    NotifyCrowdControlProvidersSessionStateChanged();
 
                     var player = !string.IsNullOrEmpty(notifySteamId) ? FindPlayerBySteamId(notifySteamId) : null;
                     if (player != null)
@@ -2474,6 +2749,7 @@ namespace Oxide.Plugins
                         {
                             session.GameSessionId = retryGameSessionId;
                             SaveData();
+                            NotifyCrowdControlProvidersSessionStateChanged();
                             return;
                         }
                     }
@@ -4203,6 +4479,7 @@ namespace Oxide.Plugins
 
             if (refreshed > 0)
             {
+                NotifyCrowdControlProvidersSessionStateChanged();
                 Puts($"Reload refresh completed for {refreshed} Crowd Control session(s).");
             }
         }
