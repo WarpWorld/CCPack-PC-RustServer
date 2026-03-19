@@ -20,19 +20,21 @@ namespace Oxide.Plugins
     {
         private const string PermUse = "crowdcontrol.use";
         private const string PermAdmin = "crowdcontrol.admin";
+        private const string PermIgnore = "crowdcontrol.ignore";
         private const bool StopSessionOnDisconnect = true;
         private const int SocketKeepAliveMinutes = 5;
         private const bool StopSessionOnUnload = true;
         private const bool AutoStartSessionAfterAuth = true;
         private const float ReconnectDelaySeconds = 5f;
-        private const int MaxAuthQueue = 50;
+        private const int MaxAuthQueue = 100;
         private const string GamePackId = "RustServer";
         private const string PubSubWebSocketUrl = "wss://pubsub.crowdcontrol.live";
         private const string OpenApiUrl = "https://openapi.crowdcontrol.live";
         private const string UserAgent = "CrowdControl/0.1.0";
         private const bool VerboseLogging = true;
         private const int CustomEffectsPerOperation = 20;
-        private const string EffectPricingFileName = "CrowdControl-Effects.json";
+        private const string DefaultEffectsFileName = "CrowdControl-DefaultEffects.json";
+        private const string CustomEffectsFilePrefix = "CrowdControl-CustomEffects-";
         private const float ExternalEffectPendingTimeoutSeconds = 15f;
         private const string ExternalEffectHookName = "OnCrowdControlEffect";
         private const string BuiltInEffectsPluginName = "CrowdControlEffects";
@@ -59,6 +61,7 @@ namespace Oxide.Plugins
         private readonly Dictionary<string, DateTime> _lastCustomEffectsSyncUtc = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> _recentHandledRequestIds = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, EffectRetryState> _activeEffectRetries = new Dictionary<string, EffectRetryState>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, CrowdControlEnforcementState> _crowdControlEnforcementBySteamId = new Dictionary<string, CrowdControlEnforcementState>(StringComparer.OrdinalIgnoreCase);
         private readonly object _requestIdSync = new object();
         private readonly object _externalEffectsSync = new object();
         private readonly Dictionary<string, ExternalEffectDefinition> _externalEffectsById = new Dictionary<string, ExternalEffectDefinition>(StringComparer.OrdinalIgnoreCase);
@@ -78,7 +81,8 @@ namespace Oxide.Plugins
 
         private sealed class PluginConfig
         {
-            // Default IDs, you can get unique ones for your own server is you wish. Reach out to support@crowdcontrol.live for more info.
+            // These defaults can be overridden in CrowdControl.json.
+            // Server owners reach out to support@crowdcontrol.live for your own app_id and app_secret if you wish.
             [JsonProperty("app_id")]
             public string AppId { get; set; } = "ccaid-01kjfx91h9cf0mqa7j2z3tjmwx";
 
@@ -93,6 +97,9 @@ namespace Oxide.Plugins
 
             [JsonProperty("retry_policy")]
             public RetryPolicyConfig RetryPolicy { get; set; } = new RetryPolicyConfig();
+
+            [JsonProperty("enforce_crowd_control")]
+            public EnforceCrowdControlConfig EnforceCrowdControl { get; set; } = new EnforceCrowdControlConfig();
         }
 
         private sealed class SessionRulesConfig
@@ -152,6 +159,18 @@ namespace Oxide.Plugins
             public float RetryIntervalSeconds { get; set; } = 2.4f;
         }
 
+        private sealed class EnforceCrowdControlConfig
+        {
+            [JsonProperty("enabled")]
+            public bool Enabled { get; set; } = false;
+
+            [JsonProperty("enforce_time_seconds")]
+            public int EnforceTimeSeconds { get; set; } = 120;
+
+            [JsonProperty("restrict_movement")]
+            public bool RestrictMovement { get; set; } = false;
+        }
+
         private sealed class EffectPricingScaleConfig
         {
             [JsonProperty("percent")]
@@ -168,6 +187,12 @@ namespace Oxide.Plugins
         {
             [JsonProperty("effectID")]
             public string EffectId { get; set; }
+
+            [JsonProperty("name")]
+            public string Name { get; set; }
+
+            [JsonProperty("description")]
+            public string Description { get; set; }
 
             [JsonProperty("price")]
             public int Price { get; set; }
@@ -186,6 +211,7 @@ namespace Oxide.Plugins
 
             [JsonProperty("scale")]
             public EffectPricingScaleConfig Scale { get; set; } = new EffectPricingScaleConfig();
+
         }
 
         private sealed class ExternalEffectDefinition
@@ -193,7 +219,8 @@ namespace Oxide.Plugins
             public string ProviderName;
             public string EffectId;
             public JObject MenuEffect;
-            public bool SyncMenu = true;
+            public bool LocalOnly;
+            public JObject DefaultMenuEffect;
         }
 
         private sealed class ExternalEffectPendingRequest
@@ -270,6 +297,17 @@ namespace Oxide.Plugins
             public Oxide.Plugins.Timer RetryTimer;
         }
 
+        private sealed class CrowdControlEnforcementState
+        {
+            public string SteamId;
+            public bool IsEnforced;
+            public Vector3 AnchorPosition;
+            public Oxide.Plugins.Timer GraceTimer;
+            public Oxide.Plugins.Timer MovementTimer;
+            public Oxide.Plugins.Timer ReminderTimer;
+            public DateTime LastBlockedNoticeUtc = DateTime.MinValue;
+        }
+
         private sealed class DecodedJwt
         {
             public string CcUid;
@@ -289,6 +327,7 @@ namespace Oxide.Plugins
             _isUnloading = false;
             permission.RegisterPermission(PermUse, this);
             permission.RegisterPermission(PermAdmin, this);
+            permission.RegisterPermission(PermIgnore, this);
             _data = Interface.Oxide.DataFileSystem.ReadObject<StoredData>(Name) ?? new StoredData();
             Puts("CrowdControl initialized.");
         }
@@ -297,13 +336,13 @@ namespace Oxide.Plugins
         {
             ValidateConfig();
             SaveConfig();
-            LoadOrSeedEffectPricingEntries();
             FireAndForget(RefreshSessionsAfterReloadAsync(), "refresh sessions after reload");
             FireAndForget(ApplySessionRulesAsync(), "apply session rules");
             FireAndForget(EnsureSocketConnectedAsync(), "initial socket connect");
             StartSocketHeartbeat();
             WarnIfBuiltInEffectsPluginMissing("server initialization", null, false);
             NotifyCrowdControlProvidersSessionStateChanged();
+            RefreshCrowdControlEnforcementForAllPlayers();
         }
 
         private void Unload()
@@ -374,6 +413,7 @@ namespace Oxide.Plugins
 
             FireAndForget(EnsureSocketConnectedAsync(), "socket state check on disconnect");
             NotifyCrowdControlProvidersSessionStateChanged();
+            ClearCrowdControlEnforcement(player.UserIDString, showReleasedMessage: false);
         }
 
         private void OnPlayerConnected(BasePlayer player)
@@ -383,10 +423,8 @@ namespace Oxide.Plugins
                 return;
             }
 
-            if (IsPlayerAllowedForCrowdControl(player))
-            {
-                player.ChatMessage("Rust Crowd Control support is available. Open your console (F1) and type crowdcontrol for next steps.");
-            }
+            MaybeShowCrowdControlJoinInstructions(player);
+            RefreshCrowdControlEnforcement(player);
 
             FireAndForget(EnsureSocketConnectedAsync(), "socket state check on connect");
             if (_data.PlayerSessions.TryGetValue(player.UserIDString, out var session) &&
@@ -426,6 +464,52 @@ namespace Oxide.Plugins
             {
                 PrintWarning("CrowdControlEffects unloaded; built-in effects will be unavailable until it is loaded again.");
             }
+        }
+
+        private object OnPlayerAttack(BasePlayer attacker, HitInfo hitInfo)
+        {
+            if (!IsCrowdControlEnforced(attacker))
+            {
+                return null;
+            }
+
+            NotifyCrowdControlEnforcementBlocked(attacker);
+            return true;
+        }
+
+        private object CanDropActiveItem(BasePlayer player)
+        {
+            if (!IsCrowdControlEnforced(player))
+            {
+                return null;
+            }
+
+            NotifyCrowdControlEnforcementBlocked(player);
+            return false;
+        }
+
+        private object CanLootEntity(BasePlayer player, BaseEntity entity)
+        {
+            if (!IsCrowdControlEnforced(player))
+            {
+                return null;
+            }
+
+            NotifyCrowdControlEnforcementBlocked(player);
+            TryClosePlayerInventory(player);
+            return false;
+        }
+
+        private object CanLootPlayer(BasePlayer target, BasePlayer looter)
+        {
+            if (!IsCrowdControlEnforced(looter))
+            {
+                return null;
+            }
+
+            NotifyCrowdControlEnforcementBlocked(looter);
+            TryClosePlayerInventory(looter);
+            return false;
         }
 
         #endregion
@@ -476,11 +560,27 @@ namespace Oxide.Plugins
 
             if (args.Length == 0)
             {
+                if (!CanUsePlugin(player))
+                {
+                    return;
+                }
+
                 SendHelp(player);
                 return;
             }
 
             var sub = args[0].ToLowerInvariant();
+            if (string.Equals(sub, "reload", StringComparison.Ordinal))
+            {
+                HandleReloadCommand(player);
+                return;
+            }
+
+            if (!CanUsePlugin(player))
+            {
+                return;
+            }
+
             switch (sub)
             {
                 case "help":
@@ -498,9 +598,6 @@ namespace Oxide.Plugins
                     break;
                 case "settings":
                     HandleSettingsCommand(player);
-                    break;
-                case "reload":
-                    HandleReloadCommand(player);
                     break;
                 case "restart":
                     HandleRestartSessionCommand(player);
@@ -524,6 +621,7 @@ namespace Oxide.Plugins
             player.ConsoleMessage($"[CrowdControl] /crowdcontrol reload - Reload Crowd Control config/data and refresh sessions ({PermAdmin})");
             player.ConsoleMessage("[CrowdControl] /crowdcontrol restart - Restart game session using saved token");
             player.ConsoleMessage("[CrowdControl] Console usage: crowdcontrol <link|unlink|status|settings|restart|reload>");
+            player.ConsoleMessage($"[CrowdControl] Auth/enforcement bypass permission: {PermIgnore}");
             player.ConsoleMessage("[CrowdControl] Alias: /cc <same_subcommand>");
             ShowEffectUi(player, "Crowd Control", "Help sent to F1 console.");
         }
@@ -574,16 +672,10 @@ namespace Oxide.Plugins
                 return;
             }
 
-            if (!_data.PlayerSessions.TryGetValue(player.UserIDString, out var session) || string.IsNullOrEmpty(session.Token))
-            {
-                ShowEffectUi(player, "Crowd Control", "No Crowd Control session found. Run /cc link to connect.");
-                return;
-            }
-
-            var expires = DateTimeOffset.FromUnixTimeSeconds(session.TokenExpiryUnix).UtcDateTime;
-            ShowEffectUi(player, "Crowd Control", $"Authenticated as {session.DisplayName} ({session.CcUid}).");
-            ShowEffectUi(player, "Crowd Control", $"Token expires (UTC): {expires:O}");
-            ShowEffectUi(player, "Crowd Control", $"Game Session ID: {(string.IsNullOrEmpty(session.GameSessionId) ? "none" : session.GameSessionId)}");
+            _data.PlayerSessions.TryGetValue(player.UserIDString, out var session);
+            var isConnected = HasActiveGameSession(player.UserIDString, session);
+            ShowEffectUi(player, "Crowd Control", $"Status: {(isConnected ? "Connected" : "Not connected")}");
+            ShowEffectUi(player, "Crowd Control", $"Version: {Version}");
         }
 
         private void HandleSettingsCommand(BasePlayer player)
@@ -598,10 +690,13 @@ namespace Oxide.Plugins
             var retryDefault = retry.Default ?? new RetrySourcePolicyConfig();
             var retryTwitch = retry.Twitch ?? retryDefault;
             var retryTiktok = retry.Tiktok ?? retryDefault;
+            var enforce = _config?.EnforceCrowdControl ?? new EnforceCrowdControlConfig();
 
             player.ConsoleMessage("[CrowdControl] Active server settings:");
             player.ConsoleMessage($"[CrowdControl] Access: {(_config?.AllowAllUsersWithoutPermission ?? true ? "all players may use Crowd Control" : $"permission required ({PermUse})")}");
+            player.ConsoleMessage($"[CrowdControl] Auth bypass permission: {PermIgnore}");
             player.ConsoleMessage($"[CrowdControl] Session rules: integration triggers={(rules.EnableIntegrationTriggers ? "enabled" : "disabled")}, price changes={(rules.EnablePriceChange ? "enabled" : "disabled")}, test effects={(rules.DisableTestEffects ? "disabled" : "enabled")}, custom effect sync={(rules.DisableCustomEffectsSync ? "disabled" : "enabled")}");
+            player.ConsoleMessage($"[CrowdControl] Enforcement: {(enforce.Enabled ? "enabled" : "disabled")}, grace={Math.Max(30, enforce.EnforceTimeSeconds)}s, restrict movement={(enforce.RestrictMovement ? "enabled" : "disabled")}");
             player.ConsoleMessage($"[CrowdControl] Retry policy: {(retry.Enabled ? "enabled" : "disabled")}");
             player.ConsoleMessage($"[CrowdControl] Retry default: attempts={retryDefault.MaxAttempts}, duration={retryDefault.MaxDurationSeconds}s, interval={retryDefault.RetryIntervalSeconds:0.##}s");
             player.ConsoleMessage($"[CrowdControl] Retry Twitch: attempts={retryTwitch.MaxAttempts}, duration={retryTwitch.MaxDurationSeconds}s, interval={retryTwitch.RetryIntervalSeconds:0.##}s");
@@ -620,11 +715,12 @@ namespace Oxide.Plugins
             ValidateConfig();
             SaveConfig();
             _data = Interface.Oxide.DataFileSystem.ReadObject<StoredData>(Name) ?? new StoredData();
-            LoadOrSeedEffectPricingEntries();
+            RefreshRegisteredProviderEffectConfigs();
             FireAndForget(RefreshSessionsAfterReloadAsync(), "admin reload refresh sessions");
             FireAndForget(ApplySessionRulesAsync(), "admin reload apply session rules");
             FireAndForget(EnsureSocketConnectedAsync(), "admin reload socket ensure");
             NotifyCrowdControlProvidersSessionStateChanged();
+            RefreshCrowdControlEnforcementForAllPlayers();
             ShowEffectUi(player, "Crowd Control", "Reloaded config/data and refreshing Crowd Control sessions.");
         }
 
@@ -662,6 +758,7 @@ namespace Oxide.Plugins
             _data.PlayerSessions.Remove(player.UserIDString);
             SaveData();
             FireAndForget(EnsureSocketConnectedAsync(), "socket state check on logout");
+            RefreshCrowdControlEnforcement(player);
             ShowEffectUi(player, "Crowd Control", "Crowd Control credentials removed.");
         }
 
@@ -731,6 +828,8 @@ namespace Oxide.Plugins
             }
 
             var normalizedProvider = providerName.Trim();
+            var defaultsById = BuildProviderEffectEntries(parsed, localOnly);
+            var configuredById = LoadOrSeedProviderEffectEntries(normalizedProvider, defaultsById, localOnly);
             var registered = 0;
             var registeredMenuEffects = 0;
             lock (_externalEffectsSync)
@@ -740,10 +839,23 @@ namespace Oxide.Plugins
                     providerEffectIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     _externalEffectIdsByProvider[normalizedProvider] = providerEffectIds;
                 }
+                else
+                {
+                    foreach (var existingEffectId in providerEffectIds)
+                    {
+                        _externalEffectsById.Remove(existingEffectId);
+                    }
+
+                    providerEffectIds.Clear();
+                }
 
                 for (var i = 0; i < parsed.Count; i++)
                 {
-                    var item = parsed[i];
+                    if (!(parsed[i] is JObject item))
+                    {
+                        continue;
+                    }
+
                     var effectId = item.Value<string>("effectID");
                     if (string.IsNullOrWhiteSpace(effectId))
                     {
@@ -751,30 +863,21 @@ namespace Oxide.Plugins
                     }
 
                     effectId = NormalizeEffectId(effectId);
-                    var syncMenu = !localOnly && item.Value<bool?>("syncMenu") != false;
-                    var menuObj = new JObject
-                    {
-                        ["name"] = item.Value<string>("name") ?? effectId,
-                        ["description"] = item.Value<string>("description") ?? "External effect.",
-                        ["price"] = Math.Max(0, item.Value<int?>("price") ?? 0)
-                    };
-
-                    var duration = item["duration"] as JObject;
-                    if (duration != null)
-                    {
-                        menuObj["duration"] = (JObject)duration.DeepClone();
-                    }
+                    defaultsById.TryGetValue(effectId, out var defaultEntry);
+                    configuredById.TryGetValue(effectId, out var configuredEntry);
+                    var menuObj = BuildConfiguredEffectMenu(item, configuredEntry ?? defaultEntry, localOnly);
 
                     _externalEffectsById[effectId] = new ExternalEffectDefinition
                     {
                         ProviderName = normalizedProvider,
                         EffectId = effectId,
                         MenuEffect = menuObj,
-                        SyncMenu = syncMenu
+                        LocalOnly = localOnly,
+                        DefaultMenuEffect = (JObject)item.DeepClone()
                     };
                     providerEffectIds.Add(effectId);
                     registered++;
-                    if (syncMenu)
+                    if (!localOnly)
                     {
                         registeredMenuEffects++;
                     }
@@ -787,13 +890,339 @@ namespace Oxide.Plugins
             }
 
             LogVerbose(
-                $"Registered {registered} {(localOnly ? "local-only" : "external")} effect(s) from provider={normalizedProvider}.");
+                $"Registered {registered} {(localOnly ? "local-only" : "external")} effect(s) from provider={normalizedProvider} using {Path.GetFileName(GetProviderEffectFilePath(normalizedProvider, localOnly))}.");
             if (registeredMenuEffects > 0)
             {
                 FireAndForget(SyncCustomEffectsForAllSessionsAsync(), "external effects register sync");
             }
 
             return true;
+        }
+
+        private Dictionary<string, EffectPricingEntry> BuildProviderEffectEntries(JArray parsed, bool localOnly)
+        {
+            var results = new Dictionary<string, EffectPricingEntry>(StringComparer.OrdinalIgnoreCase);
+            if (parsed == null)
+            {
+                return results;
+            }
+
+            for (var i = 0; i < parsed.Count; i++)
+            {
+                if (!(parsed[i] is JObject item))
+                {
+                    continue;
+                }
+
+                var effectId = NormalizeEffectId(item.Value<string>("effectID"));
+                if (string.IsNullOrWhiteSpace(effectId))
+                {
+                    continue;
+                }
+
+                results[effectId] = new EffectPricingEntry
+                {
+                    EffectId = effectId,
+                    Name = item.Value<string>("name") ?? effectId,
+                    Description = item.Value<string>("description") ?? "External effect.",
+                    Price = Math.Max(0, item.Value<int?>("price") ?? 0),
+                    SessionCooldown = Math.Max(0, item.Value<int?>("sessionCooldown") ?? 0),
+                    UserCooldown = Math.Max(0, item.Value<int?>("userCooldown") ?? 0),
+                    Duration = item["duration"] as JObject != null ? (JObject)((JObject)item["duration"]).DeepClone() : null,
+                    Inactive = item.Value<bool?>("inactive") ?? false,
+                    Scale = item["scale"] as JObject != null
+                        ? new EffectPricingScaleConfig
+                        {
+                            Percent = item["scale"]?["percent"]?.Value<float?>() ?? 1f,
+                            Duration = item["scale"]?["duration"]?.Value<float?>() ?? 1f,
+                            Inactive = item["scale"]?["inactive"]?.Value<bool?>() ?? true
+                        }
+                        : new EffectPricingScaleConfig(),
+                };
+            }
+
+            return results;
+        }
+
+        private Dictionary<string, EffectPricingEntry> LoadOrSeedProviderEffectEntries(string providerName, Dictionary<string, EffectPricingEntry> defaultsById, bool localOnly)
+        {
+            var path = GetProviderEffectFilePath(providerName, localOnly);
+            var byId = new Dictionary<string, EffectPricingEntry>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kvp in defaultsById)
+            {
+                byId[kvp.Key] = CloneEffectPricingEntry(kvp.Value);
+            }
+
+            var changed = false;
+            try
+            {
+                if (File.Exists(path))
+                {
+                    var json = File.ReadAllText(path);
+                    var loadedArray = JArray.Parse(json);
+                    for (var i = 0; i < loadedArray.Count; i++)
+                    {
+                        if (!(loadedArray[i] is JObject entryObj))
+                        {
+                            continue;
+                        }
+
+                        if (entryObj.Property("syncMenu") != null)
+                        {
+                            changed = true;
+                        }
+
+                        if (localOnly &&
+                            (entryObj.Property("name") != null ||
+                             entryObj.Property("description") != null))
+                        {
+                            changed = true;
+                        }
+
+                        var entry = entryObj.ToObject<EffectPricingEntry>();
+                        if (entry == null || string.IsNullOrWhiteSpace(entry.EffectId))
+                        {
+                            continue;
+                        }
+
+                        entry.EffectId = NormalizeEffectId(entry.EffectId);
+                        entry.Scale = entry.Scale ?? new EffectPricingScaleConfig();
+                        byId[entry.EffectId] = entry;
+                    }
+                }
+                else
+                {
+                    changed = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"Failed reading {Path.GetFileName(path)}, using defaults: {ex.Message}");
+                changed = true;
+            }
+
+            foreach (var kvp in defaultsById)
+            {
+                if (!byId.ContainsKey(kvp.Key))
+                {
+                    byId[kvp.Key] = CloneEffectPricingEntry(kvp.Value);
+                    changed = true;
+                }
+            }
+
+            if (changed)
+            {
+                WriteProviderEffectEntries(path, byId, localOnly);
+            }
+
+            return byId;
+        }
+
+        private void WriteProviderEffectEntries(string path, Dictionary<string, EffectPricingEntry> byId, bool localOnly)
+        {
+            try
+            {
+                var ordered = new List<EffectPricingEntry>(byId.Values);
+                ordered.Sort((a, b) => string.Compare(a?.EffectId, b?.EffectId, StringComparison.OrdinalIgnoreCase));
+                var serializedEntries = new JArray();
+                for (var i = 0; i < ordered.Count; i++)
+                {
+                    var entry = ordered[i];
+                    if (entry == null || string.IsNullOrWhiteSpace(entry.EffectId))
+                    {
+                        continue;
+                    }
+
+                    serializedEntries.Add(SerializeEffectPricingEntry(entry, localOnly));
+                }
+
+                var serialized = JsonConvert.SerializeObject(serializedEntries, Formatting.Indented);
+                File.WriteAllText(path, serialized + Environment.NewLine, Encoding.UTF8);
+                LogVerbose($"Wrote {Path.GetFileName(path)} with {ordered.Count} effect entries.");
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"Failed writing {Path.GetFileName(path)}: {ex.Message}");
+            }
+        }
+
+        private JObject SerializeEffectPricingEntry(EffectPricingEntry entry, bool localOnly)
+        {
+            var obj = new JObject
+            {
+                ["effectID"] = entry.EffectId,
+                ["price"] = Math.Max(0, entry.Price),
+                ["sessionCooldown"] = Math.Max(0, entry.SessionCooldown),
+                ["userCooldown"] = Math.Max(0, entry.UserCooldown),
+                ["inactive"] = entry.Inactive
+            };
+
+            if (!localOnly)
+            {
+                obj["name"] = entry.Name ?? entry.EffectId;
+                obj["description"] = entry.Description ?? "External effect.";
+            }
+
+            if (entry.Duration != null)
+            {
+                obj["duration"] = (JObject)entry.Duration.DeepClone();
+            }
+
+            if (entry.Scale != null)
+            {
+                obj["scale"] = new JObject
+                {
+                    ["percent"] = entry.Scale.Percent,
+                    ["duration"] = entry.Scale.Duration,
+                    ["inactive"] = entry.Scale.Inactive
+                };
+            }
+
+            return obj;
+        }
+
+        private EffectPricingEntry CloneEffectPricingEntry(EffectPricingEntry source)
+        {
+            if (source == null)
+            {
+                return null;
+            }
+
+            return new EffectPricingEntry
+            {
+                EffectId = source.EffectId,
+                Name = source.Name,
+                Description = source.Description,
+                Price = source.Price,
+                SessionCooldown = source.SessionCooldown,
+                UserCooldown = source.UserCooldown,
+                Duration = source.Duration != null ? (JObject)source.Duration.DeepClone() : null,
+                Inactive = source.Inactive,
+                Scale = new EffectPricingScaleConfig
+                {
+                    Percent = source.Scale?.Percent ?? 1f,
+                    Duration = source.Scale?.Duration ?? 1f,
+                    Inactive = source.Scale?.Inactive ?? true
+                }
+            };
+        }
+
+        private JObject BuildConfiguredEffectMenu(JObject defaultMenu, EffectPricingEntry entry, bool localOnly)
+        {
+            var menu = defaultMenu != null ? (JObject)defaultMenu.DeepClone() : new JObject();
+            menu["name"] = entry?.Name ?? menu.Value<string>("name") ?? menu.Value<string>("effectID") ?? "Unnamed Effect";
+            menu["description"] = entry?.Description ?? menu.Value<string>("description") ?? "External effect.";
+            menu["price"] = Math.Max(0, entry?.Price ?? menu.Value<int?>("price") ?? 0);
+            menu["sessionCooldown"] = Math.Max(0, entry?.SessionCooldown ?? menu.Value<int?>("sessionCooldown") ?? 0);
+            menu["userCooldown"] = Math.Max(0, entry?.UserCooldown ?? menu.Value<int?>("userCooldown") ?? 0);
+            menu["inactive"] = entry?.Inactive ?? menu.Value<bool?>("inactive") ?? false;
+
+            if (entry?.Duration != null)
+            {
+                menu["duration"] = (JObject)entry.Duration.DeepClone();
+            }
+
+            if (entry?.Scale != null && !entry.Scale.Inactive)
+            {
+                menu["scale"] = new JObject
+                {
+                    ["percent"] = entry.Scale.Percent,
+                    ["duration"] = entry.Scale.Duration
+                };
+            }
+            else
+            {
+                menu.Remove("scale");
+            }
+            return menu;
+        }
+
+        private string GetProviderEffectFilePath(string providerName, bool localOnly)
+        {
+            if (localOnly && string.Equals(providerName, BuiltInEffectsPluginName, StringComparison.OrdinalIgnoreCase))
+            {
+                return Path.Combine(Interface.Oxide.RootDirectory, "oxide", "plugins", DefaultEffectsFileName);
+            }
+
+            var safeProviderName = SanitizeFileSegment(providerName);
+            var fileName = $"{CustomEffectsFilePrefix}{safeProviderName}.json";
+            return Path.Combine(Interface.Oxide.RootDirectory, "oxide", "plugins", fileName);
+        }
+
+        private string SanitizeFileSegment(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return "UnknownProvider";
+            }
+
+            var builder = new StringBuilder(value.Length);
+            foreach (var ch in value)
+            {
+                builder.Append(char.IsLetterOrDigit(ch) || ch == '-' || ch == '_' ? ch : '_');
+            }
+
+            return builder.ToString().Trim('_');
+        }
+
+        private Dictionary<string, EffectPricingEntry> BuildRegisteredProviderDefaults(string providerName)
+        {
+            var results = new Dictionary<string, EffectPricingEntry>(StringComparer.OrdinalIgnoreCase);
+            lock (_externalEffectsSync)
+            {
+                foreach (var kvp in _externalEffectsById)
+                {
+                    var def = kvp.Value;
+                    if (def == null || !string.Equals(def.ProviderName, providerName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var entry = BuildProviderEffectEntries(new JArray { def.DefaultMenuEffect ?? def.MenuEffect }, def.LocalOnly);
+                    if (entry.TryGetValue(kvp.Key, out var builtEntry))
+                    {
+                        results[kvp.Key] = builtEntry;
+                    }
+                }
+            }
+
+            return results;
+        }
+
+        private void RefreshRegisteredProviderEffectConfigs()
+        {
+            var providers = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            lock (_externalEffectsSync)
+            {
+                foreach (var def in _externalEffectsById.Values)
+                {
+                    if (def == null || string.IsNullOrWhiteSpace(def.ProviderName))
+                    {
+                        continue;
+                    }
+
+                    providers[def.ProviderName] = def.LocalOnly;
+                }
+            }
+
+            foreach (var kvp in providers)
+            {
+                var defaultsById = BuildRegisteredProviderDefaults(kvp.Key);
+                var configuredById = LoadOrSeedProviderEffectEntries(kvp.Key, defaultsById, kvp.Value);
+                lock (_externalEffectsSync)
+                {
+                    foreach (var def in _externalEffectsById.Values)
+                    {
+                        if (def == null || !string.Equals(def.ProviderName, kvp.Key, StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+
+                        configuredById.TryGetValue(def.EffectId, out var entry);
+                        def.MenuEffect = BuildConfiguredEffectMenu(def.DefaultMenuEffect ?? def.MenuEffect, entry, def.LocalOnly);
+                    }
+                }
+            }
         }
 
         [HookMethod("CC_CompleteEffect")]
@@ -1121,7 +1550,7 @@ namespace Oxide.Plugins
             foreach (var kvp in _data.PlayerSessions)
             {
                 var session = kvp.Value;
-                if (session == null || string.IsNullOrEmpty(session.Token))
+                if (!HasActiveGameSession(kvp.Key, session))
                 {
                     continue;
                 }
@@ -1146,11 +1575,17 @@ namespace Oxide.Plugins
 
         private async Task SyncCustomEffectsForAllSessionsAsync()
         {
+            if (!HasAnyActiveGameSession())
+            {
+                LogVerbose("No active Crowd Control sessions available; skipping custom effect sync refresh.");
+                return;
+            }
+
             foreach (var kvp in _data.PlayerSessions)
             {
                 var steamId = kvp.Key;
                 var session = kvp.Value;
-                if (session == null || string.IsNullOrWhiteSpace(session.Token))
+                if (!HasActiveGameSession(steamId, session))
                 {
                     continue;
                 }
@@ -1200,6 +1635,191 @@ namespace Oxide.Plugins
             }
 
             return true;
+        }
+
+        private bool HasCrowdControlAuth(string steamId)
+        {
+            return !string.IsNullOrWhiteSpace(steamId) &&
+                _data?.PlayerSessions != null &&
+                _data.PlayerSessions.TryGetValue(steamId, out var session) &&
+                !string.IsNullOrEmpty(session?.Token);
+        }
+
+        private bool IsPlayerIgnoredForCrowdControlAuth(BasePlayer player)
+        {
+            return player != null && permission.UserHasPermission(player.UserIDString, PermIgnore);
+        }
+
+        private bool ShouldPromptCrowdControlLink(BasePlayer player)
+        {
+            return player != null &&
+                IsPlayerAllowedForCrowdControl(player) &&
+                !IsPlayerIgnoredForCrowdControlAuth(player) &&
+                !HasCrowdControlAuth(player.UserIDString);
+        }
+
+        private void MaybeShowCrowdControlJoinInstructions(BasePlayer player)
+        {
+            if (!ShouldPromptCrowdControlLink(player))
+            {
+                return;
+            }
+
+            player.ChatMessage("Crowd Control is available on this server. Press F1 and type /cc link to connect.");
+            ShowEffectUi(player, "Crowd Control", "Press F1 and type /cc link to connect.");
+            player.ConsoleMessage("[CrowdControl] Crowd Control is available on this server.");
+            player.ConsoleMessage("[CrowdControl] Press F1 and run: /cc link");
+            player.ConsoleMessage("[CrowdControl] Other useful commands: /cc status, /cc settings");
+
+            if (!_crowdControlEnforcementBySteamId.TryGetValue(player.UserIDString, out var state))
+            {
+                state = new CrowdControlEnforcementState { SteamId = player.UserIDString };
+                _crowdControlEnforcementBySteamId[player.UserIDString] = state;
+            }
+
+            state.ReminderTimer?.Destroy();
+            state.ReminderTimer = timer.Once(8f, () =>
+            {
+                state.ReminderTimer = null;
+                var current = FindPlayerBySteamId(player.UserIDString);
+                if (ShouldPromptCrowdControlLink(current))
+                {
+                    ShowEffectUi(current, "Crowd Control", "Reminder: press F1 and type /cc link to connect.");
+                }
+            });
+        }
+
+        private void RefreshCrowdControlEnforcementForAllPlayers()
+        {
+            foreach (var player in BasePlayer.activePlayerList)
+            {
+                if (player != null && player.IsConnected)
+                {
+                    RefreshCrowdControlEnforcement(player);
+                }
+            }
+        }
+
+        private void RefreshCrowdControlEnforcement(BasePlayer player)
+        {
+            if (player == null)
+            {
+                return;
+            }
+
+            if (!ShouldPromptCrowdControlLink(player) || !(_config?.EnforceCrowdControl?.Enabled ?? false))
+            {
+                ClearCrowdControlEnforcement(player.UserIDString, showReleasedMessage: false);
+                return;
+            }
+
+            if (!_crowdControlEnforcementBySteamId.TryGetValue(player.UserIDString, out var state))
+            {
+                state = new CrowdControlEnforcementState
+                {
+                    SteamId = player.UserIDString
+                };
+                _crowdControlEnforcementBySteamId[player.UserIDString] = state;
+            }
+
+            state.IsEnforced = false;
+            state.AnchorPosition = player.transform.position;
+            state.GraceTimer?.Destroy();
+            state.MovementTimer?.Destroy();
+            state.MovementTimer = null;
+
+            var graceSeconds = Math.Max(30, _config?.EnforceCrowdControl?.EnforceTimeSeconds ?? 120);
+            state.GraceTimer = timer.Once(graceSeconds, () =>
+            {
+                state.GraceTimer = null;
+                ActivateCrowdControlEnforcement(player.UserIDString);
+            });
+        }
+
+        private void ActivateCrowdControlEnforcement(string steamId)
+        {
+            var player = FindPlayerBySteamId(steamId);
+            if (player == null || !ShouldPromptCrowdControlLink(player))
+            {
+                ClearCrowdControlEnforcement(steamId, showReleasedMessage: false);
+                return;
+            }
+
+            if (!_crowdControlEnforcementBySteamId.TryGetValue(steamId, out var state))
+            {
+                state = new CrowdControlEnforcementState
+                {
+                    SteamId = steamId
+                };
+                _crowdControlEnforcementBySteamId[steamId] = state;
+            }
+
+            state.IsEnforced = true;
+            state.AnchorPosition = player.transform.position;
+            ShowErrorUi(player, "Crowd Control linking is required. Press F1 and type /cc link now.");
+            player.ConsoleMessage("[CrowdControl] Crowd Control linking is required on this server.");
+            player.ConsoleMessage("[CrowdControl] Press F1 and run: /cc link");
+            TryClosePlayerInventory(player);
+
+            if (_config?.EnforceCrowdControl?.RestrictMovement == true)
+            {
+                state.MovementTimer?.Destroy();
+                state.MovementTimer = timer.Every(0.1f, () =>
+                {
+                    var current = FindPlayerBySteamId(steamId);
+                    if (current == null || !ShouldPromptCrowdControlLink(current))
+                    {
+                        ClearCrowdControlEnforcement(steamId, showReleasedMessage: false);
+                        return;
+                    }
+
+                    current.Teleport(state.AnchorPosition);
+                });
+            }
+        }
+
+        private void ClearCrowdControlEnforcement(string steamId, bool showReleasedMessage)
+        {
+            if (string.IsNullOrWhiteSpace(steamId) || !_crowdControlEnforcementBySteamId.TryGetValue(steamId, out var state))
+            {
+                return;
+            }
+
+            var wasEnforced = state.IsEnforced;
+            state.GraceTimer?.Destroy();
+            state.ReminderTimer?.Destroy();
+            state.MovementTimer?.Destroy();
+            _crowdControlEnforcementBySteamId.Remove(steamId);
+
+            var player = FindPlayerBySteamId(steamId);
+            if (showReleasedMessage && wasEnforced && player != null && player.IsConnected)
+            {
+                ShowEffectUi(player, "Crowd Control", "Crowd Control link detected. Restrictions lifted.");
+            }
+        }
+
+        private bool IsCrowdControlEnforced(BasePlayer player)
+        {
+            return player != null &&
+                _crowdControlEnforcementBySteamId.TryGetValue(player.UserIDString, out var state) &&
+                state != null &&
+                state.IsEnforced;
+        }
+
+        private void NotifyCrowdControlEnforcementBlocked(BasePlayer player)
+        {
+            if (player == null || !player.IsConnected || !_crowdControlEnforcementBySteamId.TryGetValue(player.UserIDString, out var state))
+            {
+                return;
+            }
+
+            if ((DateTime.UtcNow - state.LastBlockedNoticeUtc).TotalSeconds < 5)
+            {
+                return;
+            }
+
+            state.LastBlockedNoticeUtc = DateTime.UtcNow;
+            ShowErrorUi(player, "Link Crowd Control with /cc link before playing.");
         }
 
         private bool IsPlayerAllowedForCrowdControl(BasePlayer player)
@@ -1709,6 +2329,7 @@ namespace Oxide.Plugins
                     ShowEffectUi(player, "Crowd Control", "Crowd Control auth complete.");
                     ShowEffectUi(player, "Crowd Control", $"Connected profile: {decoded.Name} ({decoded.CcUid})");
                 }
+                ClearCrowdControlEnforcement(steamId, showReleasedMessage: true);
                 WarnIfBuiltInEffectsPluginMissing("auth completion", player);
 
                 if (IsSteamPlayerOnline(steamId))
@@ -1941,6 +2562,13 @@ namespace Oxide.Plugins
             }
 
             if (!string.IsNullOrEmpty(steamId) &&
+                (!_data.PlayerSessions.TryGetValue(steamId, out var session) || !HasActiveGameSession(steamId, session)))
+            {
+                LogVerbose($"Skipping custom-effects sync for {steamId}: no active Crowd Control session.");
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(steamId) &&
                 _lastCustomEffectsSyncUtc.TryGetValue(steamId, out var lastSyncUtc) &&
                 DateTime.UtcNow - lastSyncUtc < TimeSpan.FromSeconds(3))
             {
@@ -2040,14 +2668,17 @@ namespace Oxide.Plugins
                 return;
             }
 
-            var entries = LoadOrSeedEffectPricingEntries();
-            if (entries.Count == 0)
+            var defaultsById = BuildRegisteredProviderDefaults(BuiltInEffectsPluginName);
+            var entriesById = LoadOrSeedProviderEffectEntries(BuiltInEffectsPluginName, defaultsById, localOnly: true);
+            if (entriesById.Count == 0)
             {
                 LogVerbose("No effect pricing entries available; skipping default game effect override sync.");
                 return;
             }
 
             var effectOverrides = new JArray();
+            var entries = new List<EffectPricingEntry>(entriesById.Values);
+            entries.Sort((a, b) => string.Compare(a?.EffectId, b?.EffectId, StringComparison.OrdinalIgnoreCase));
             for (var i = 0; i < entries.Count; i++)
             {
                 var entry = entries[i];
@@ -2057,8 +2688,8 @@ namespace Oxide.Plugins
                 }
 
                 // The default-effect override endpoint only accepts default game pack effects.
-                // Local test effects are intentionally excluded from this upload.
-                if (entry.EffectId.StartsWith("test_", StringComparison.OrdinalIgnoreCase))
+                // Exclude local-only test/demo effects that do not exist as default pack effects.
+                if (string.Equals(entry.EffectId, "test_hype_train", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
@@ -2212,176 +2843,6 @@ namespace Oxide.Plugins
                 || message.IndexOf("\"code\":\"UNAUTHORIZED\"", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
-        private string GetEffectPricingFilePath()
-        {
-            return Path.Combine(Interface.Oxide.RootDirectory, "oxide", "plugins", EffectPricingFileName);
-        }
-
-        private List<EffectPricingEntry> LoadOrSeedEffectPricingEntries()
-        {
-            var path = GetEffectPricingFilePath();
-            var defaults = BuildDefaultEffectPricingEntriesFromBaseUpdated();
-            var byId = new Dictionary<string, EffectPricingEntry>(StringComparer.OrdinalIgnoreCase);
-            for (var i = 0; i < defaults.Count; i++)
-            {
-                var entry = defaults[i];
-                if (entry != null && !string.IsNullOrWhiteSpace(entry.EffectId))
-                {
-                    byId[entry.EffectId] = entry;
-                }
-            }
-
-            var changed = false;
-            try
-            {
-                if (File.Exists(path))
-                {
-                    var json = File.ReadAllText(path);
-                    var loaded = JsonConvert.DeserializeObject<List<EffectPricingEntry>>(json) ?? new List<EffectPricingEntry>();
-                    for (var i = 0; i < loaded.Count; i++)
-                    {
-                        var entry = loaded[i];
-                        if (entry == null || string.IsNullOrWhiteSpace(entry.EffectId))
-                        {
-                            continue;
-                        }
-
-                        entry.Scale = entry.Scale ?? new EffectPricingScaleConfig();
-                        byId[entry.EffectId] = entry;
-                    }
-                }
-                else
-                {
-                    changed = true;
-                }
-            }
-            catch (Exception ex)
-            {
-                PrintWarning($"Failed reading {EffectPricingFileName}, using defaults: {ex.Message}");
-                changed = true;
-            }
-
-            foreach (var entry in defaults)
-            {
-                if (entry == null || string.IsNullOrWhiteSpace(entry.EffectId))
-                {
-                    continue;
-                }
-
-                if (!byId.ContainsKey(entry.EffectId))
-                {
-                    byId[entry.EffectId] = entry;
-                    changed = true;
-                }
-            }
-
-            var ordered = new List<EffectPricingEntry>(byId.Values);
-            ordered.Sort((a, b) => string.Compare(a?.EffectId, b?.EffectId, StringComparison.OrdinalIgnoreCase));
-
-            if (changed)
-            {
-                try
-                {
-                    var serialized = JsonConvert.SerializeObject(ordered, Formatting.Indented);
-                    File.WriteAllText(path, serialized + Environment.NewLine, Encoding.UTF8);
-                    LogVerbose($"Wrote {EffectPricingFileName} with {ordered.Count} effect pricing entries.");
-                }
-                catch (Exception ex)
-                {
-                    PrintWarning($"Failed writing {EffectPricingFileName}: {ex.Message}");
-                }
-            }
-
-            return ordered;
-        }
-
-        private List<EffectPricingEntry> BuildDefaultEffectPricingEntriesFromBaseUpdated()
-        {
-            var results = new List<EffectPricingEntry>();
-            var path = Path.Combine(Interface.Oxide.RootDirectory, "oxide", "plugins", "effects.json");
-            if (!File.Exists(path))
-            {
-                PrintWarning("effects.json not found; cannot auto-seed effect pricing entries.");
-                return results;
-            }
-
-            try
-            {
-                var root = JObject.Parse(File.ReadAllText(path));
-                var effects = root["effects"]?["game"] as JObject;
-                if (effects == null)
-                {
-                    return results;
-                }
-
-                foreach (var prop in effects.Properties())
-                {
-                    var effectObj = prop.Value as JObject;
-                    var entry = new EffectPricingEntry
-                    {
-                        EffectId = prop.Name,
-                        Price = effectObj?.Value<int?>("price") ?? 0,
-                        SessionCooldown = effectObj?.Value<int?>("sessionCooldown") ?? 0,
-                        UserCooldown = effectObj?.Value<int?>("userCooldown") ?? 0,
-                        Inactive = effectObj?.Value<bool?>("inactive") ?? false,
-                        Duration = effectObj?["duration"] as JObject != null
-                            ? (JObject)((JObject)effectObj["duration"]).DeepClone()
-                            : null,
-                        Scale = new EffectPricingScaleConfig
-                        {
-                            Percent = effectObj?["scale"]?["percent"]?.Value<float?>() ?? 1f,
-                            Duration = effectObj?["scale"]?["duration"]?.Value<float?>() ?? 1f,
-                            Inactive = effectObj?["scale"]?["inactive"]?.Value<bool?>() ?? true
-                        }
-                    };
-
-                    results.Add(entry);
-                }
-            }
-            catch (Exception ex)
-            {
-                PrintWarning($"Failed building default effect pricing entries from effects.json: {ex.Message}");
-            }
-
-            return results;
-        }
-
-        private Dictionary<string, string> LoadEffectNamesFromBaseUpdated()
-        {
-            var results = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            var path = Path.Combine(Interface.Oxide.RootDirectory, "oxide", "plugins", "effects.json");
-            if (!File.Exists(path))
-            {
-                return results;
-            }
-
-            try
-            {
-                var root = JObject.Parse(File.ReadAllText(path));
-                var effects = root["effects"]?["game"] as JObject;
-                if (effects == null)
-                {
-                    return results;
-                }
-
-                foreach (var prop in effects.Properties())
-                {
-                    var effectObj = prop.Value as JObject;
-                    var name = effectObj?.Value<string>("name");
-                    if (!string.IsNullOrWhiteSpace(name))
-                    {
-                        results[prop.Name] = name;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                PrintWarning($"Failed loading effect names from effects.json: {ex.Message}");
-            }
-
-            return results;
-        }
-
         private JArray BuildChunkedCustomEffectOperations(JObject effects, int perOperation)
         {
             var operations = new JArray();
@@ -2402,44 +2863,23 @@ namespace Oxide.Plugins
 
         private JObject BuildCustomEffectsPayload()
         {
-
-            /*
-                Custom effects 
-
-            */
-            var effects = new JObject
-            {
-                ["player_kill"] = new JObject { ["name"] = "Player Kill", ["price"] = 300, ["description"] = "Instantly kill the player." },
-                ["test_hype_train"] = new JObject { ["name"] = "TEST: Hype Train", ["price"] = 25, ["description"] = "Test effect: spawn a short-lived hype train with stub names and sound." },
-                ["player_teleport_to_sleeping_bag"] = new JObject { ["name"] = "Teleport To Sleeping Bag", ["price"] = 220, ["description"] = "Teleport player to one of their sleeping bags." }
-            };
+            var effects = new JObject();
 
             lock (_externalEffectsSync)
             {
                 foreach (var kvp in _externalEffectsById)
                 {
                     var def = kvp.Value;
-                    if (def?.MenuEffect == null || string.IsNullOrWhiteSpace(def.EffectId) || !def.SyncMenu)
+                    if (def?.MenuEffect == null || string.IsNullOrWhiteSpace(def.EffectId) || def.LocalOnly)
                     {
                         continue;
                     }
 
-                    effects[def.EffectId] = (JObject)def.MenuEffect.DeepClone();
+                    var menuEffect = (JObject)def.MenuEffect.DeepClone();
+                    menuEffect.Remove("effectID");
+                    effects[def.EffectId] = menuEffect;
                 }
             }
-
-            // Intentionally kept as reference (disabled).
-            // Pricing enforcement is now handled by CrowdControl-Effects.json + replace-partial sync.
-            /*
-            if (_config?.SessionRules != null && !_config.SessionRules.EnablePriceChange)
-            {
-                foreach (var prop in effects.Properties())
-                {
-                    var effect = prop.Value as JObject;
-                    effect?.Remove("price");
-                }
-            }
-            */
 
             return effects;
         }
@@ -3380,6 +3820,32 @@ namespace Oxide.Plugins
             return false;
         }
 
+        private bool HasAnyActiveGameSession()
+        {
+            if (_data?.PlayerSessions == null || _data.PlayerSessions.Count == 0)
+            {
+                return false;
+            }
+
+            foreach (var kvp in _data.PlayerSessions)
+            {
+                if (HasActiveGameSession(kvp.Key, kvp.Value))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private bool HasActiveGameSession(string steamId, PlayerSessionState session)
+        {
+            return session != null &&
+                !string.IsNullOrWhiteSpace(session.Token) &&
+                !string.IsNullOrWhiteSpace(session.GameSessionId) &&
+                IsSteamPlayerOnline(steamId);
+        }
+
         private bool HasPendingAuthRequests()
         {
             lock (_pendingAuthRequests)
@@ -3599,6 +4065,11 @@ namespace Oxide.Plugins
                 _config.RetryPolicy = new RetryPolicyConfig();
             }
 
+            if (_config.EnforceCrowdControl == null)
+            {
+                _config.EnforceCrowdControl = new EnforceCrowdControlConfig();
+            }
+
             if (_config.RetryPolicy.Default == null)
             {
                 _config.RetryPolicy.Default = new RetrySourcePolicyConfig
@@ -3629,6 +4100,8 @@ namespace Oxide.Plugins
                 };
             }
 
+            _config.EnforceCrowdControl.EnforceTimeSeconds = Math.Max(30, _config.EnforceCrowdControl.EnforceTimeSeconds);
+
             if (string.IsNullOrWhiteSpace(_config.AppId) || _config.AppId == "INSERT_APP_ID")
             {
                 PrintWarning("Set app_id in CrowdControl.json before using auth flow.");
@@ -3651,15 +4124,31 @@ namespace Oxide.Plugins
             base.LoadConfig();
             try
             {
+                var defaultConfig = new PluginConfig();
                 _config = Config.ReadObject<PluginConfig>();
                 if (_config == null)
                 {
                     throw new Exception("Config deserialized null.");
                 }
 
+                if (string.IsNullOrWhiteSpace(_config.AppId) || _config.AppId == "INSERT_APP_ID")
+                {
+                    _config.AppId = defaultConfig.AppId;
+                }
+
+                if (string.IsNullOrWhiteSpace(_config.AppSecret) || _config.AppSecret == "INSERT_APP_SECRET")
+                {
+                    _config.AppSecret = defaultConfig.AppSecret;
+                }
+
                 if (_config.SessionRules == null)
                 {
                     _config.SessionRules = new SessionRulesConfig();
+                }
+
+                if (_config.EnforceCrowdControl == null)
+                {
+                    _config.EnforceCrowdControl = new EnforceCrowdControlConfig();
                 }
             }
             catch (Exception ex)
@@ -3886,6 +4375,31 @@ namespace Oxide.Plugins
             }
 
             return false;
+        }
+
+        private void TryClosePlayerInventory(BasePlayer player)
+        {
+            if (player == null)
+            {
+                return;
+            }
+
+            try
+            {
+                var endLootingMethod = player.GetType().GetMethod("EndLooting", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
+                endLootingMethod?.Invoke(player, null);
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                player.SendConsoleCommand("inventory.close");
+            }
+            catch
+            {
+            }
         }
 
         private void ShowEffectUi(BasePlayer player, string title, string message)
