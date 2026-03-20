@@ -4,7 +4,7 @@ using Oxide.Core.Plugins;
 
 namespace Oxide.Plugins
 {
-    [Info("CrowdControlRustExamples", "jaku", "0.1.0")]
+    [Info("CrowdControlRustExamples", "Warp World", "1.0.0")]
     [Description("Example external Crowd Control provider with 3 effect patterns.")]
     public class CrowdControlRustExamples : RustPlugin
     {
