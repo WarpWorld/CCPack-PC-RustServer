@@ -14,7 +14,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("CrowdControl", "Warp World", "1.0.0")]
+    [Info("CrowdControl", "Warp World", "1.0.1")]
     [Description("Crowd Control integration for Rust with auth, PubSub, and permission-based access controls.")]
     public class CrowdControl : RustPlugin
     {
@@ -92,7 +92,7 @@ namespace Oxide.Plugins
             public string AppSecret { get; set; } = "b9b187f3026b70aad6017dbe41a62445811acc4bb2d3b4c092e445b11ee72fa3";
 
             [JsonProperty("allow_all_users_without_permission")]
-            public bool AllowAllUsersWithoutPermission { get; set; } = true;
+            public bool AllowAllUsersWithoutPermission { get; set; } = false;
 
             [JsonProperty("session_rules")]
             public SessionRulesConfig SessionRules { get; set; } = new SessionRulesConfig();
@@ -737,13 +737,7 @@ namespace Oxide.Plugins
                 return;
             }
 
-            FireAndForget(EnsureSocketConnectedAsync(), "auth command socket ensure");
-            FireAndForget(SendGenerateAuthCodeAsync(), "send generate auth code");
-            SendCommandReply(player, authReplyMode, "Auth code request submitted. Watch this console for your code.");
-            if (requestedFromChat)
-            {
-                SendCommandReply(player, CommandReplyMode.Chat, "Auth started. Press F1 to view your Crowd Control code in console.");
-            }
+            FireAndForget(RequestAuthCodeAsync(player.UserIDString, authReplyMode, requestedFromChat), "request auth code");
         }
 
         private void HandleStatusCommand(BasePlayer player, CommandReplyMode replyMode)
@@ -1830,6 +1824,70 @@ namespace Oxide.Plugins
             }
         }
 
+        private void RemovePendingAuthRequest(string steamId)
+        {
+            lock (_pendingAuthRequests)
+            {
+                if (string.IsNullOrWhiteSpace(steamId) || _pendingAuthRequests.Count == 0)
+                {
+                    return;
+                }
+
+                var retainedRequests = new Queue<string>();
+                while (_pendingAuthRequests.Count > 0)
+                {
+                    var queuedSteamId = _pendingAuthRequests.Dequeue();
+                    if (!string.Equals(queuedSteamId, steamId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        retainedRequests.Enqueue(queuedSteamId);
+                    }
+                }
+
+                while (retainedRequests.Count > 0)
+                {
+                    _pendingAuthRequests.Enqueue(retainedRequests.Dequeue());
+                }
+            }
+        }
+
+        private async Task RequestAuthCodeAsync(string steamId, CommandReplyMode replyMode, bool requestedFromChat)
+        {
+            try
+            {
+                await EnsureSocketConnectedAsync();
+                await SendGenerateAuthCodeAsync();
+
+                var player = FindPlayerBySteamId(steamId);
+                if (player == null)
+                {
+                    return;
+                }
+
+                SendCommandReply(player, replyMode, "Auth code request submitted. Watch this console for your code.");
+                if (requestedFromChat)
+                {
+                    SendCommandReply(player, CommandReplyMode.Chat, "Auth started. Press F1 to view your Crowd Control code in console.");
+                }
+            }
+            catch (Exception ex)
+            {
+                RemovePendingAuthRequest(steamId);
+                ClearAuthReplyMode(steamId);
+
+                var player = FindPlayerBySteamId(steamId);
+                if (player != null)
+                {
+                    SendCommandReply(player, replyMode, "Failed to submit Crowd Control auth request. Please try again.");
+                    if (requestedFromChat)
+                    {
+                        SendCommandReply(player, CommandReplyMode.Chat, "Crowd Control auth could not start. Press F1 for details, then try again.");
+                    }
+                }
+
+                throw new InvalidOperationException($"Auth request submission failed for SteamID {steamId}: {ex.Message}", ex);
+            }
+        }
+
         private bool CanUsePlugin(BasePlayer player, CommandReplyMode? replyMode = null)
         {
             if (player == null)
@@ -2099,6 +2157,11 @@ namespace Oxide.Plugins
                 return;
             }
 
+            if (await WaitForSocketConnectionAsync())
+            {
+                return;
+            }
+
             lock (_socketSync)
             {
                 if (_isUnloading || _isSocketConnecting)
@@ -2159,6 +2222,30 @@ namespace Oxide.Plugins
                 {
                     _isSocketConnecting = false;
                 }
+            }
+        }
+
+        private async Task<bool> WaitForSocketConnectionAsync()
+        {
+            while (true)
+            {
+                if (_socket != null && _socket.State == WebSocketState.Open)
+                {
+                    return true;
+                }
+
+                var isConnecting = false;
+                lock (_socketSync)
+                {
+                    isConnecting = _isSocketConnecting;
+                }
+
+                if (!isConnecting)
+                {
+                    return _socket != null && _socket.State == WebSocketState.Open;
+                }
+
+                await Task.Delay(100);
             }
         }
 
