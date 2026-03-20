@@ -14,7 +14,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("CrowdControl", "jaku", "0.1.1")]
+    [Info("CrowdControl", "Warp World", "1.0.0")]
     [Description("Crowd Control integration for Rust with auth, PubSub, and permission-based access controls.")]
     public class CrowdControl : RustPlugin
     {

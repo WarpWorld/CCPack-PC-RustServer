@@ -8,7 +8,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("CrowdControlEffects", "jaku", "0.1.0")]
+    [Info("CrowdControlEffects", "Warp World", "1.0.0")]
     [Description("Built-in Crowd Control Rust effect provider.")]
     public class CrowdControlEffects : RustPlugin
     {
