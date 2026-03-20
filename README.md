@@ -78,7 +78,7 @@ Behavior:
 
 ## Commands
 
-Player commands:
+Player chat commands:
 
 - `/cc link`
 - `/cc auth`
@@ -94,9 +94,11 @@ Admin command:
 
 Aliases:
 
-- `/crowdcontrol ...`
+- chat alias `/crowdcontrol ...`
 - console command `crowdcontrol ...`
-- console/chat alias `cc ...`
+- console alias `cc ...`
+
+Use `/` only in chat. In F1 console, run `cc ...` or `crowdcontrol ...` without a slash.
 
 ## Permissions
 
@@ -413,7 +415,7 @@ In short, `CrowdControl.cs` should ideally load first, but the current setup is 
 ## Recommendations for plugin developers
 
 - keep gameplay logic in your provider plugin, not in `CrowdControl.cs`
-- use `CC_RegisterLocalEffects(...)` for built-in/server-known effects
+- do not use  `CC_RegisterLocalEffects(...)` this is for the Crowd Control team and our default effects
 - use `CC_RegisterEffects(...)` for true custom effects
 - let the base plugin own generated effect metadata files
 - prefer returning structured `JObject` responses
