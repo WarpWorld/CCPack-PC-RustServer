@@ -1870,7 +1870,10 @@ namespace Oxide.Plugins
                 return false;
             }
 
-            var hadSession = _data?.PlayerSessions != null && _data.PlayerSessions.TryGetValue(steamId, out var session) && session != null;
+            PlayerSessionState session = null;
+            var hadSession = _data?.PlayerSessions != null &&
+                _data.PlayerSessions.TryGetValue(steamId, out session) &&
+                session != null;
             var hadPendingState = HasPendingAuthState(steamId);
 
             if (stopActiveSession &&
