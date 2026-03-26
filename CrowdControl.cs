@@ -14,7 +14,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("CrowdControl", "Warp World", "1.0.1")]
+    [Info("CrowdControl", "Warp World", "1.0.2")]
     [Description("Crowd Control integration for Rust with auth, PubSub, and permission-based access controls.")]
     public class CrowdControl : RustPlugin
     {
@@ -30,7 +30,7 @@ namespace Oxide.Plugins
         private const string GamePackId = "RustServer";
         private const string PubSubWebSocketUrl = "wss://pubsub.crowdcontrol.live";
         private const string OpenApiUrl = "https://openapi.crowdcontrol.live";
-        private const string UserAgent = "CrowdControl/0.1.0";
+        private const string UserAgent = "CrowdControl/1.0.2";
         private const bool VerboseLogging = true;
         private const int CustomEffectsPerOperation = 20;
         private const string DefaultEffectsFileName = "CrowdControl-DefaultEffects.json";
@@ -241,6 +241,14 @@ namespace Oxide.Plugins
             Console
         }
 
+        private enum StoredSessionStatus
+        {
+            Missing,
+            Valid,
+            Expired,
+            Invalid
+        }
+
         private sealed class ActiveAuthCodeState
         {
             public string Code;
@@ -368,7 +376,7 @@ namespace Oxide.Plugins
                 foreach (var kvp in _data.PlayerSessions)
                 {
                     var session = kvp.Value;
-                    if (!string.IsNullOrEmpty(session?.Token))
+                    if (IsSessionTokenUsable(session))
                     {
                         FireAndForget(StopGameSessionAsync(session), "stop game session on unload");
                     }
@@ -420,7 +428,7 @@ namespace Oxide.Plugins
 
             if (StopSessionOnDisconnect &&
                 _data.PlayerSessions.TryGetValue(player.UserIDString, out var session) &&
-                !string.IsNullOrEmpty(session?.Token))
+                IsSessionTokenUsable(session))
             {
                 FireAndForget(StopGameSessionAsync(session, player.UserIDString), "stop session on disconnect");
             }
@@ -437,13 +445,12 @@ namespace Oxide.Plugins
                 return;
             }
 
+            PruneStoredSessionIfInvalid(player.UserIDString, CommandReplyMode.Console, notifyPlayer: false);
             MaybeShowCrowdControlJoinInstructions(player);
             RefreshCrowdControlEnforcement(player);
 
             FireAndForget(EnsureSocketConnectedAsync(), "socket state check on connect");
-            if (_data.PlayerSessions.TryGetValue(player.UserIDString, out var session) &&
-                session != null &&
-                !string.IsNullOrEmpty(session.Token) &&
+            if (TryGetAuthenticatedSession(player.UserIDString, out var session, pruneInvalid: false) &&
                 string.IsNullOrEmpty(session.GameSessionId))
             {
                 FireAndForget(RestartGameSessionAsync(session, player.UserIDString), "start session on connect");
@@ -675,8 +682,8 @@ namespace Oxide.Plugins
                 return;
             }
 
-            if (_data.PlayerSessions.TryGetValue(player.UserIDString, out var existingSession) &&
-                !string.IsNullOrEmpty(existingSession?.Token))
+            PruneStoredSessionIfInvalid(player.UserIDString, authReplyMode, notifyPlayer: false);
+            if (TryGetAuthenticatedSession(player.UserIDString, out _))
             {
                 SendCommandReply(
                     player,
@@ -747,7 +754,8 @@ namespace Oxide.Plugins
                 return;
             }
 
-            _data.PlayerSessions.TryGetValue(player.UserIDString, out var session);
+            PruneStoredSessionIfInvalid(player.UserIDString, replyMode, notifyPlayer: true);
+            TryGetAuthenticatedSession(player.UserIDString, out var session, pruneInvalid: false);
             var isConnected = HasActiveGameSession(player.UserIDString, session);
             SendCommandReply(player, replyMode, $"Status: {(isConnected ? "Connected" : "Not connected")}");
             SendCommandReply(player, replyMode, $"Version: {Version}");
@@ -809,15 +817,19 @@ namespace Oxide.Plugins
                 return;
             }
 
-            if (!_data.PlayerSessions.TryGetValue(player.UserIDString, out var session) || string.IsNullOrEmpty(session?.Token))
+            var sessionStatus = PruneStoredSessionIfInvalid(player.UserIDString, replyMode, notifyPlayer: true);
+            if (!TryGetAuthenticatedSession(player.UserIDString, out var session, pruneInvalid: false))
             {
-                SendCommandReply(
-                    player,
-                    replyMode,
-                    replyMode == CommandReplyMode.Console
-                        ? "No saved Crowd Control token. Run cc link first."
-                        : "No saved Crowd Control token. Run /cc link first."
-                );
+                if (sessionStatus == StoredSessionStatus.Missing)
+                {
+                    SendCommandReply(
+                        player,
+                        replyMode,
+                        replyMode == CommandReplyMode.Console
+                            ? "No saved Crowd Control token. Run cc link first."
+                            : "No saved Crowd Control token. Run /cc link first."
+                    );
+                }
                 return;
             }
 
@@ -832,17 +844,12 @@ namespace Oxide.Plugins
                 return;
             }
 
-            if (!_data.PlayerSessions.TryGetValue(player.UserIDString, out var session))
+            if (!ClearPlayerAuthState(player.UserIDString, stopActiveSession: true))
             {
                 SendCommandReply(player, replyMode, "No active auth state to clear.");
                 return;
             }
 
-            FireAndForget(StopGameSessionAsync(session), "logout stop session");
-            _data.PlayerSessions.Remove(player.UserIDString);
-            SaveData();
-            FireAndForget(EnsureSocketConnectedAsync(), "socket state check on logout");
-            RefreshCrowdControlEnforcement(player);
             SendCommandReply(player, replyMode, "Crowd Control credentials removed.");
         }
 
@@ -1328,12 +1335,7 @@ namespace Oxide.Plugins
                 }
 
                 var session = kvp.Value;
-                if (session == null || string.IsNullOrEmpty(session.Token) || string.IsNullOrEmpty(session.GameSessionId))
-                {
-                    continue;
-                }
-
-                if (!IsSteamPlayerOnline(kvp.Key))
+                if (!HasActiveGameSession(kvp.Key, session))
                 {
                     continue;
                 }
@@ -1850,6 +1852,64 @@ namespace Oxide.Plugins
             }
         }
 
+        private bool HasPendingAuthState(string steamId)
+        {
+            lock (_pendingAuthRequests)
+            {
+                return !string.IsNullOrWhiteSpace(steamId) &&
+                    (_pendingAuthRequests.Contains(steamId) ||
+                     _activeAuthCodesBySteamId.ContainsKey(steamId) ||
+                     _authReplyModeBySteamId.ContainsKey(steamId));
+            }
+        }
+
+        private bool ClearPlayerAuthState(string steamId, bool stopActiveSession, bool refreshSocketState = true)
+        {
+            if (string.IsNullOrWhiteSpace(steamId))
+            {
+                return false;
+            }
+
+            var hadSession = _data?.PlayerSessions != null && _data.PlayerSessions.TryGetValue(steamId, out var session) && session != null;
+            var hadPendingState = HasPendingAuthState(steamId);
+
+            if (stopActiveSession &&
+                hadSession &&
+                IsSessionTokenUsable(session) &&
+                !string.IsNullOrEmpty(session.GameSessionId))
+            {
+                FireAndForget(StopGameSessionAsync(session), "clear auth stop session");
+            }
+
+            if (hadSession)
+            {
+                _data.PlayerSessions.Remove(steamId);
+            }
+
+            RemovePendingAuthRequest(steamId);
+            ClearActiveAuthCode(steamId);
+            ClearAuthReplyMode(steamId);
+
+            if (hadSession)
+            {
+                SaveData();
+                NotifyCrowdControlProvidersSessionStateChanged();
+            }
+
+            var player = FindPlayerBySteamId(steamId);
+            if (player != null)
+            {
+                RefreshCrowdControlEnforcement(player);
+            }
+
+            if (refreshSocketState && (hadSession || hadPendingState))
+            {
+                FireAndForget(EnsureSocketConnectedAsync(), "socket state check after auth clear");
+            }
+
+            return hadSession || hadPendingState;
+        }
+
         private async Task RequestAuthCodeAsync(string steamId, CommandReplyMode replyMode, bool requestedFromChat)
         {
             try
@@ -1937,10 +1997,7 @@ namespace Oxide.Plugins
 
         private bool HasCrowdControlAuth(string steamId)
         {
-            return !string.IsNullOrWhiteSpace(steamId) &&
-                _data?.PlayerSessions != null &&
-                _data.PlayerSessions.TryGetValue(steamId, out var session) &&
-                !string.IsNullOrEmpty(session?.Token);
+            return TryGetAuthenticatedSession(steamId, out _);
         }
 
         private bool IsPlayerIgnoredForCrowdControlAuth(BasePlayer player)
@@ -2558,11 +2615,12 @@ namespace Oxide.Plugins
 
         private async Task ResubscribeAllSessionsAsync()
         {
+            PruneInvalidStoredSessions();
             foreach (var kvp in _data.PlayerSessions)
             {
                 var session = kvp.Value;
                 if (session == null ||
-                    string.IsNullOrEmpty(session.Token) ||
+                    !IsSessionTokenUsable(session) ||
                     string.IsNullOrEmpty(session.CcUid) ||
                     !IsSteamPlayerOnline(kvp.Key))
                 {
@@ -2713,7 +2771,7 @@ namespace Oxide.Plugins
 
         private async Task StartGameSessionAsync(PlayerSessionState session, string notifySteamId = null)
         {
-            if (session == null || string.IsNullOrEmpty(session.Token))
+            if (!IsSessionTokenUsable(session))
             {
                 return;
             }
@@ -2902,7 +2960,7 @@ namespace Oxide.Plugins
 
         private async Task RestartGameSessionAsync(PlayerSessionState session, string notifySteamId = null)
         {
-            if (session == null || string.IsNullOrEmpty(session.Token))
+            if (!IsSessionTokenUsable(session))
             {
                 return;
             }
@@ -3249,7 +3307,7 @@ namespace Oxide.Plugins
 
         private async Task StopGameSessionAsync(PlayerSessionState session, string notifySteamId = null)
         {
-            if (session == null || string.IsNullOrEmpty(session.Token))
+            if (!IsSessionTokenUsable(session))
             {
                 return;
             }
@@ -3434,7 +3492,7 @@ namespace Oxide.Plugins
             }
 
             var responseToken = string.Empty;
-            if (!_data.PlayerSessions.TryGetValue(steamId, out var session) || string.IsNullOrEmpty(session.Token))
+            if (!TryGetAuthenticatedSession(steamId, out var session))
             {
                 if (_activeEffectRetries.TryGetValue(requestId, out var missingSessionRetryState) &&
                     !string.IsNullOrEmpty(missingSessionRetryState?.Token))
@@ -4169,7 +4227,7 @@ namespace Oxide.Plugins
             foreach (var kvp in _data.PlayerSessions)
             {
                 var session = kvp.Value;
-                if (session == null || string.IsNullOrEmpty(session.Token))
+                if (!IsSessionTokenUsable(session))
                 {
                     continue;
                 }
@@ -4204,7 +4262,7 @@ namespace Oxide.Plugins
         private bool HasActiveGameSession(string steamId, PlayerSessionState session)
         {
             return session != null &&
-                !string.IsNullOrWhiteSpace(session.Token) &&
+                IsSessionTokenUsable(session) &&
                 !string.IsNullOrWhiteSpace(session.GameSessionId) &&
                 IsSteamPlayerOnline(steamId);
         }
@@ -4219,6 +4277,7 @@ namespace Oxide.Plugins
 
         private bool ShouldMaintainSocketConnection()
         {
+            PruneInvalidStoredSessions();
             return HasAnyOnlinePlayerWithToken() || HasPendingAuthRequests();
         }
 
@@ -4242,12 +4301,162 @@ namespace Oxide.Plugins
 
             foreach (var kvp in _data.PlayerSessions)
             {
-                if (string.Equals(kvp.Value?.CcUid, ccUid, StringComparison.OrdinalIgnoreCase))
+                if (IsSessionTokenUsable(kvp.Value) &&
+                    string.Equals(kvp.Value?.CcUid, ccUid, StringComparison.OrdinalIgnoreCase))
                 {
                     return kvp.Key;
                 }
             }
             return null;
+        }
+
+        private bool TryGetSessionTokenExpiryUnix(PlayerSessionState session, out long expiryUnix)
+        {
+            expiryUnix = 0;
+            if (session == null || string.IsNullOrWhiteSpace(session.Token))
+            {
+                return false;
+            }
+
+            if (session.TokenExpiryUnix > 0)
+            {
+                expiryUnix = session.TokenExpiryUnix;
+                return true;
+            }
+
+            var decoded = DecodeJwt(session.Token);
+            if (decoded == null || decoded.Exp <= 0)
+            {
+                return false;
+            }
+
+            session.TokenExpiryUnix = decoded.Exp;
+            if (string.IsNullOrWhiteSpace(session.CcUid) && !string.IsNullOrWhiteSpace(decoded.CcUid))
+            {
+                session.CcUid = decoded.CcUid;
+            }
+
+            if (string.IsNullOrWhiteSpace(session.OriginId) && !string.IsNullOrWhiteSpace(decoded.OriginId))
+            {
+                session.OriginId = decoded.OriginId;
+            }
+
+            if (string.IsNullOrWhiteSpace(session.ProfileType) && !string.IsNullOrWhiteSpace(decoded.ProfileType))
+            {
+                session.ProfileType = decoded.ProfileType;
+            }
+
+            if (string.IsNullOrWhiteSpace(session.DisplayName) && !string.IsNullOrWhiteSpace(decoded.Name))
+            {
+                session.DisplayName = decoded.Name;
+            }
+
+            expiryUnix = session.TokenExpiryUnix;
+            return true;
+        }
+
+        private bool IsSessionTokenUsable(PlayerSessionState session)
+        {
+            return TryGetSessionTokenExpiryUnix(session, out var expiryUnix) &&
+                expiryUnix > DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        }
+
+        private StoredSessionStatus GetStoredSessionStatus(string steamId, out PlayerSessionState session)
+        {
+            session = null;
+            if (string.IsNullOrWhiteSpace(steamId) ||
+                _data?.PlayerSessions == null ||
+                !_data.PlayerSessions.TryGetValue(steamId, out session) ||
+                session == null ||
+                string.IsNullOrWhiteSpace(session.Token))
+            {
+                session = null;
+                return StoredSessionStatus.Missing;
+            }
+
+            if (TryGetSessionTokenExpiryUnix(session, out var expiryUnix))
+            {
+                return expiryUnix > DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                    ? StoredSessionStatus.Valid
+                    : StoredSessionStatus.Expired;
+            }
+
+            return StoredSessionStatus.Invalid;
+        }
+
+        private bool TryGetAuthenticatedSession(string steamId, out PlayerSessionState session, bool pruneInvalid = true)
+        {
+            var status = GetStoredSessionStatus(steamId, out session);
+            if (status == StoredSessionStatus.Valid)
+            {
+                return true;
+            }
+
+            if (pruneInvalid && (status == StoredSessionStatus.Expired || status == StoredSessionStatus.Invalid))
+            {
+                ClearPlayerAuthState(steamId, stopActiveSession: false);
+            }
+
+            session = null;
+            return false;
+        }
+
+        private string GetTokenReauthMessage(CommandReplyMode replyMode, bool invalidToken)
+        {
+            if (invalidToken)
+            {
+                return replyMode == CommandReplyMode.Console
+                    ? "Saved Crowd Control token is invalid. Run cc link to reauthenticate."
+                    : "Saved Crowd Control token is invalid. Run /cc link to reauthenticate.";
+            }
+
+            return replyMode == CommandReplyMode.Console
+                ? "Saved Crowd Control token expired and was removed. Run cc link to reauthenticate."
+                : "Saved Crowd Control token expired and was removed. Run /cc link to reauthenticate.";
+        }
+
+        private StoredSessionStatus PruneStoredSessionIfInvalid(string steamId, CommandReplyMode replyMode, bool notifyPlayer)
+        {
+            var status = GetStoredSessionStatus(steamId, out _);
+            if (status != StoredSessionStatus.Expired && status != StoredSessionStatus.Invalid)
+            {
+                return status;
+            }
+
+            ClearPlayerAuthState(steamId, stopActiveSession: false);
+            if (notifyPlayer)
+            {
+                var player = FindPlayerBySteamId(steamId);
+                if (player != null && player.IsConnected)
+                {
+                    SendCommandReply(player, replyMode, GetTokenReauthMessage(replyMode, status == StoredSessionStatus.Invalid));
+                }
+            }
+
+            return status;
+        }
+
+        private void PruneInvalidStoredSessions()
+        {
+            if (_data?.PlayerSessions == null || _data.PlayerSessions.Count == 0)
+            {
+                return;
+            }
+
+            var toRemove = new List<string>();
+            foreach (var kvp in _data.PlayerSessions)
+            {
+                var status = GetStoredSessionStatus(kvp.Key, out _);
+                if (status == StoredSessionStatus.Expired || status == StoredSessionStatus.Invalid)
+                {
+                    toRemove.Add(kvp.Key);
+                }
+            }
+
+            foreach (var steamId in toRemove)
+            {
+                ClearPlayerAuthState(steamId, stopActiveSession: false, refreshSocketState: false);
+            }
         }
 
         private DecodedJwt DecodeJwt(string jwt)
@@ -4533,6 +4742,7 @@ namespace Oxide.Plugins
 
         private async Task RefreshSessionsAfterReloadAsync()
         {
+            PruneInvalidStoredSessions();
             if (_data?.PlayerSessions == null || _data.PlayerSessions.Count == 0)
             {
                 return;
@@ -4543,7 +4753,7 @@ namespace Oxide.Plugins
             foreach (var kvp in snapshot)
             {
                 var session = kvp.Value;
-                if (session == null || string.IsNullOrEmpty(session.Token))
+                if (!IsSessionTokenUsable(session))
                 {
                     continue;
                 }
@@ -4573,6 +4783,7 @@ namespace Oxide.Plugins
 
         private async Task ApplySessionRulesAsync()
         {
+            PruneInvalidStoredSessions();
             var currentSignature = GetSessionRulesSignature();
             var previousSignature = _data?.SessionRulesSignature ?? string.Empty;
 
@@ -4595,7 +4806,7 @@ namespace Oxide.Plugins
             {
                 var steamId = kvp.Key;
                 var session = kvp.Value;
-                if (session == null || string.IsNullOrEmpty(session.Token))
+                if (!IsSessionTokenUsable(session))
                 {
                     continue;
                 }
@@ -4815,7 +5026,7 @@ namespace Oxide.Plugins
             foreach (var kvp in _data.PlayerSessions)
             {
                 var session = kvp.Value;
-                if (session == null || string.IsNullOrEmpty(session.Token))
+                if (!IsSessionTokenUsable(session))
                 {
                     continue;
                 }
