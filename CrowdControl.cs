@@ -1128,6 +1128,11 @@ namespace Oxide.Plugins
                 }
 
                 var serialized = JsonConvert.SerializeObject(serializedEntries, Formatting.Indented);
+                var directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrWhiteSpace(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
                 File.WriteAllText(path, serialized + Environment.NewLine, Encoding.UTF8);
                 LogVerbose($"Wrote {Path.GetFileName(path)} with {ordered.Count} effect entries.");
             }
@@ -1230,14 +1235,23 @@ namespace Oxide.Plugins
 
         private string GetProviderEffectFilePath(string providerName, bool localOnly)
         {
+            return Path.Combine(GetOxideConfigDirectoryPath(), GetProviderEffectFileName(providerName, localOnly));
+        }
+
+        private string GetProviderEffectFileName(string providerName, bool localOnly)
+        {
             if (localOnly && string.Equals(providerName, BuiltInEffectsPluginName, StringComparison.OrdinalIgnoreCase))
             {
-                return Path.Combine(Interface.Oxide.RootDirectory, "oxide", "plugins", DefaultEffectsFileName);
+                return DefaultEffectsFileName;
             }
 
             var safeProviderName = SanitizeFileSegment(providerName);
-            var fileName = $"{CustomEffectsFilePrefix}{safeProviderName}.json";
-            return Path.Combine(Interface.Oxide.RootDirectory, "oxide", "plugins", fileName);
+            return $"{CustomEffectsFilePrefix}{safeProviderName}.json";
+        }
+
+        private string GetOxideConfigDirectoryPath()
+        {
+            return Path.Combine(Interface.Oxide.RootDirectory, "oxide", "config");
         }
 
         private string SanitizeFileSegment(string value)
