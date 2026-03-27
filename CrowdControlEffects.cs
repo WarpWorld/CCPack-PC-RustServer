@@ -228,7 +228,7 @@ namespace Oxide.Plugins
             AddBuiltInEffect(results, "spawn_nodes_metal", "Spawn Metal Nodes", "Spawn metal ore nodes around the player on safe ground.", 275);
             AddBuiltInEffect(results, "spawn_nodes_sulfur", "Spawn Sulfur Nodes", "Spawn sulfur ore nodes around the player on safe ground.", 325);
             AddBuiltInEffect(results, "spawn_sleeping_bag_here", "Spawn Sleeping Bag Here", "Force-place a sleeping bag at the player's current position.", 175);
-            AddBuiltInEffect(results, "test_hype_train", "TEST: Hype Train", "Test effect: spawn a short-lived hype train with stub rider names and sound.", 25);
+            // AddBuiltInEffect(results, "test_hype_train", "TEST: Hype Train", "Test effect: spawn a short-lived hype train with stub rider names and sound.", 25);
             AddBuiltInEffect(results, "player_teleport_to_sleeping_bag", "Teleport To Sleeping Bag", "Teleport player to one of their sleeping bags.", 225);
             AddBuiltInEffect(results, "player_teleport_to_cc_player", "Teleport To CC Player", "Teleport to another active CC player.", 150);
             AddBuiltInEffect(results, "player_teleport_swap_cc_player", "Teleport Swap CC Player", "Swap position with another active CC player.", 175);
