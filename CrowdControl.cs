@@ -3553,7 +3553,7 @@ namespace Oxide.Plugins
             var durationSeconds = effect.Value<int?>("duration") ?? 0;
             LogVerbose($"Effect request received requestID={requestId}, effectID={effectId}, duration={durationSeconds}s.");
 
-            var targetCcUid = payload["target"]?["ccUID"]?.ToString();
+            var targetCcUid = GetCrowdControlUid(payload?["target"]);
             var steamId = FindSteamIdByCcUid(targetCcUid);
             if (string.IsNullOrEmpty(steamId) &&
                 _activeEffectRetries.TryGetValue(requestId, out var retryState) &&
@@ -4974,15 +4974,24 @@ namespace Oxide.Plugins
                 return true;
             }
 
-            var requesterCcUid = payload?["requester"]?["ccUID"]?.ToString() ??
-                                 payload?["requester"]?["ccUid"]?.ToString() ??
-                                 string.Empty;
-            var targetCcUid = payload?["target"]?["ccUID"]?.ToString() ??
-                              payload?["target"]?["ccUid"]?.ToString() ??
-                              string.Empty;
+            var requesterCcUid = GetCrowdControlUid(payload?["requester"]);
+            var targetCcUid = GetCrowdControlUid(payload?["target"]);
             return !string.IsNullOrWhiteSpace(requesterCcUid) &&
                    !string.IsNullOrWhiteSpace(targetCcUid) &&
                    string.Equals(requesterCcUid, targetCcUid, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private string GetCrowdControlUid(JToken token)
+        {
+            if (token == null)
+            {
+                return string.Empty;
+            }
+
+            return (token["ccUID"]?.ToString() ??
+                    token["ccUid"]?.ToString() ??
+                    token["ccuid"]?.ToString() ??
+                    string.Empty).Trim();
         }
 
         private string BuildSearchableJsonText(params JToken[] tokens)
