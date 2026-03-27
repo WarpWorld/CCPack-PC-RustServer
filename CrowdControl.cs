@@ -14,7 +14,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("CrowdControl", "Warp World", "1.0.2")]
+    [Info("CrowdControl", "Warp World", "1.0.3")]
     [Description("Crowd Control integration for Rust with auth, PubSub, and permission-based access controls.")]
     public class CrowdControl : RustPlugin
     {
@@ -30,7 +30,7 @@ namespace Oxide.Plugins
         private const string GamePackId = "RustServer";
         private const string PubSubWebSocketUrl = "wss://pubsub.crowdcontrol.live";
         private const string OpenApiUrl = "https://openapi.crowdcontrol.live";
-        private const string UserAgent = "CrowdControl/1.0.2";
+        private const string UserAgent = "CrowdControl/1.0.3";
         private const bool VerboseLogging = true;
         private const int CustomEffectsPerOperation = 20;
         private const string DefaultEffectsFileName = "CrowdControl-DefaultEffects.json";
@@ -2431,6 +2431,12 @@ namespace Oxide.Plugins
                         HandleEffectRequest(payload);
                     }
                     break;
+                case "game-session-stop":
+                    if (domain == "pub")
+                    {
+                        HandleGameSessionStop(payload);
+                    }
+                    break;
                 default:
                     break;
             }
@@ -2543,6 +2549,38 @@ namespace Oxide.Plugins
             var success = payload["success"]?.ToString(Formatting.None) ?? "[]";
             var failure = payload["failure"]?.ToString(Formatting.None) ?? "[]";
             Puts($"Subscription result success={success}, failure={failure}");
+        }
+
+        private void HandleGameSessionStop(JObject payload)
+        {
+            var gameSessionId = payload?.Value<string>("gameSessionID");
+            if (string.IsNullOrWhiteSpace(gameSessionId) || _data?.PlayerSessions == null || _data.PlayerSessions.Count == 0)
+            {
+                return;
+            }
+
+            var handled = false;
+            foreach (var kvp in _data.PlayerSessions)
+            {
+                var session = kvp.Value;
+                if (session == null ||
+                    string.IsNullOrWhiteSpace(session.GameSessionId) ||
+                    !string.Equals(session.GameSessionId, gameSessionId, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                handled = true;
+                FinalizeStoppedGameSession(
+                    session,
+                    kvp.Key,
+                    "Crowd Control session was stopped from the Crowd Control app.");
+            }
+
+            if (!handled)
+            {
+                LogVerbose($"Ignoring game-session-stop for unknown session {gameSessionId}.");
+            }
         }
 
         private void StartReconnectTimer()
@@ -3343,38 +3381,48 @@ namespace Oxide.Plugins
                 };
 
                 await PostJsonAsync(endpoint, body, includeAuth: session.Token);
-                session.GameSessionId = null;
-
-                var hasActiveSessions = false;
-                foreach (var playerSession in _data.PlayerSessions.Values)
-                {
-                    if (!string.IsNullOrEmpty(playerSession?.GameSessionId))
-                    {
-                        hasActiveSessions = true;
-                        break;
-                    }
-                }
-
-                if (!hasActiveSessions)
-                {
-                    _data.ApplicationInstanceId = string.Empty;
-                    _data.ApplicationInstanceAppId = string.Empty;
-                }
-
-                SaveData();
-
-                var player = !string.IsNullOrEmpty(notifySteamId) ? FindPlayerBySteamId(notifySteamId) : null;
-                if (player != null)
-                {
-                    ShowErrorUi(player, "Crowd Control session ended or disconnected.");
-                }
-
-                NotifyCrowdControlProvidersSessionStateChanged();
+                FinalizeStoppedGameSession(session, notifySteamId, "Crowd Control session ended or disconnected.");
             }
             catch (Exception ex)
             {
                 PrintError($"Failed to stop game session: {ex.Message}");
             }
+        }
+
+        private void FinalizeStoppedGameSession(PlayerSessionState session, string notifySteamId, string playerMessage)
+        {
+            if (session == null || string.IsNullOrWhiteSpace(session.GameSessionId))
+            {
+                return;
+            }
+
+            session.GameSessionId = null;
+
+            var hasActiveSessions = false;
+            foreach (var playerSession in _data.PlayerSessions.Values)
+            {
+                if (!string.IsNullOrEmpty(playerSession?.GameSessionId))
+                {
+                    hasActiveSessions = true;
+                    break;
+                }
+            }
+
+            if (!hasActiveSessions)
+            {
+                _data.ApplicationInstanceId = string.Empty;
+                _data.ApplicationInstanceAppId = string.Empty;
+            }
+
+            SaveData();
+
+            var player = !string.IsNullOrEmpty(notifySteamId) ? FindPlayerBySteamId(notifySteamId) : null;
+            if (player != null && !string.IsNullOrWhiteSpace(playerMessage))
+            {
+                ShowErrorUi(player, playerMessage);
+            }
+
+            NotifyCrowdControlProvidersSessionStateChanged();
         }
 
         private Task<JObject> PostJsonAsync(string url, JObject payload, string includeAuth)
