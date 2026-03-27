@@ -683,8 +683,19 @@ namespace Oxide.Plugins
             }
 
             PruneStoredSessionIfInvalid(player.UserIDString, authReplyMode, notifyPlayer: false);
-            if (TryGetAuthenticatedSession(player.UserIDString, out _))
+            if (TryGetAuthenticatedSession(player.UserIDString, out var existingSession, pruneInvalid: false))
             {
+                if (!HasActiveGameSession(player.UserIDString, existingSession))
+                {
+                    FireAndForget(StartGameSessionAsync(existingSession, player.UserIDString), "resume session from auth command");
+                    SendCommandReply(player, authReplyMode, "Saved Crowd Control auth found. Reconnecting session...");
+                    if (requestedFromChat)
+                    {
+                        SendCommandReply(player, CommandReplyMode.Chat, "Saved auth found. Press F1 for reconnect status.");
+                    }
+                    return;
+                }
+
                 SendCommandReply(
                     player,
                     authReplyMode,
