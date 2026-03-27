@@ -3553,7 +3553,7 @@ namespace Oxide.Plugins
             var durationSeconds = effect.Value<int?>("duration") ?? 0;
             LogVerbose($"Effect request received requestID={requestId}, effectID={effectId}, duration={durationSeconds}s.");
 
-            var targetCcUid = GetCrowdControlUid(payload?["target"]);
+            var targetCcUid = GetTargetCrowdControlUid(payload);
             var steamId = FindSteamIdByCcUid(targetCcUid);
             if (string.IsNullOrEmpty(steamId) &&
                 _activeEffectRetries.TryGetValue(requestId, out var retryState) &&
@@ -3603,10 +3603,12 @@ namespace Oxide.Plugins
                 return;
             }
 
-            if (IsEffectBlockedBySessionRules(payload, effect, out var blockedReason))
+            LogVerbose(
+                $"Effect request identity requestID={requestId}, requesterCcUid={GetRequesterCrowdControlUid(payload)}, targetCcUid={targetCcUid}, sessionCcUid={session?.CcUid ?? string.Empty}.");
+            if (IsEffectBlockedBySessionRules(payload, effect, session, out var blockedReason))
             {
                 LogVerbose($"Effect request blocked by session rules requestID={requestId}, effectID={effectId}, reason={blockedReason}");
-                if ((_config?.SessionRules?.DisableTestEffects ?? false) && IsTestEffectRequest(payload, effect))
+                if ((_config?.SessionRules?.DisableTestEffects ?? false) && IsTestEffectRequest(payload, effect, session))
                 {
                     ShowEffectUi(player, "Crowd Control", "Test effect received, but test effects are disabled and it will not activate.");
                 }
@@ -4909,7 +4911,7 @@ namespace Oxide.Plugins
                 rules.DisableCustomEffectsSync ? "1" : "0");
         }
 
-        private bool IsEffectBlockedBySessionRules(JObject payload, JObject effect, out string reason)
+        private bool IsEffectBlockedBySessionRules(JObject payload, JObject effect, PlayerSessionState session, out string reason)
         {
             reason = string.Empty;
             var rules = _config?.SessionRules;
@@ -4930,7 +4932,7 @@ namespace Oxide.Plugins
                 return true;
             }
 
-            if (rules.DisableTestEffects && IsTestEffectRequest(payload, effect))
+            if (rules.DisableTestEffects && IsTestEffectRequest(payload, effect, session))
             {
                 reason = "Test effects are currently disabled by server settings.";
                 return true;
@@ -4966,7 +4968,7 @@ namespace Oxide.Plugins
             return ContainsAny(joined, "pricechange", "price_changed", "price changed", "overrideprice");
         }
 
-        private bool IsTestEffectRequest(JObject payload, JObject effect)
+        private bool IsTestEffectRequest(JObject payload, JObject effect, PlayerSessionState session = null)
         {
             if ((payload?.Value<bool?>("isTest") ?? false) ||
                 (effect?.Value<bool?>("isTest") ?? false))
@@ -4974,11 +4976,11 @@ namespace Oxide.Plugins
                 return true;
             }
 
-            var requesterCcUid = GetCrowdControlUid(payload?["requester"]);
-            var targetCcUid = GetCrowdControlUid(payload?["target"]);
-            return !string.IsNullOrWhiteSpace(requesterCcUid) &&
-                   !string.IsNullOrWhiteSpace(targetCcUid) &&
-                   string.Equals(requesterCcUid, targetCcUid, StringComparison.OrdinalIgnoreCase);
+            var requesterCcUid = GetRequesterCrowdControlUid(payload);
+            var targetCcUid = GetTargetCrowdControlUid(payload);
+            var sessionCcUid = NormalizeCrowdControlUid(session?.CcUid);
+            return CrowdControlUidsMatch(requesterCcUid, targetCcUid) ||
+                   CrowdControlUidsMatch(requesterCcUid, sessionCcUid);
         }
 
         private string GetCrowdControlUid(JToken token)
@@ -4988,10 +4990,54 @@ namespace Oxide.Plugins
                 return string.Empty;
             }
 
-            return (token["ccUID"]?.ToString() ??
-                    token["ccUid"]?.ToString() ??
-                    token["ccuid"]?.ToString() ??
-                    string.Empty).Trim();
+            return NormalizeCrowdControlUid(
+                token["ccUID"]?.ToString() ??
+                token["ccUid"]?.ToString() ??
+                token["ccuid"]?.ToString());
+        }
+
+        private string GetRequesterCrowdControlUid(JObject payload)
+        {
+            return GetFirstCrowdControlUid(
+                payload?["requester"],
+                payload?["userDisplay"],
+                payload?["requesterUser"],
+                payload?["requesterProfile"]);
+        }
+
+        private string GetTargetCrowdControlUid(JObject payload)
+        {
+            return GetFirstCrowdControlUid(
+                payload?["target"],
+                payload?["targetUser"],
+                payload?["targetProfile"],
+                payload?["user"]);
+        }
+
+        private string GetFirstCrowdControlUid(params JToken[] tokens)
+        {
+            for (var i = 0; i < tokens.Length; i++)
+            {
+                var ccUid = GetCrowdControlUid(tokens[i]);
+                if (!string.IsNullOrWhiteSpace(ccUid))
+                {
+                    return ccUid;
+                }
+            }
+
+            return string.Empty;
+        }
+
+        private bool CrowdControlUidsMatch(string left, string right)
+        {
+            return !string.IsNullOrWhiteSpace(left) &&
+                   !string.IsNullOrWhiteSpace(right) &&
+                   string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private string NormalizeCrowdControlUid(string value)
+        {
+            return string.IsNullOrWhiteSpace(value) ? string.Empty : value.Trim();
         }
 
         private string BuildSearchableJsonText(params JToken[] tokens)
