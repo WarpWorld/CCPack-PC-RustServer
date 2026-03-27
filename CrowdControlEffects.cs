@@ -166,10 +166,10 @@ namespace Oxide.Plugins
         private JArray LoadBuiltInEffects()
         {
             var results = new JArray();
-            AddBuiltInEffect(results, "player_kill", "Player Kill", "Instantly kill the player.", 300);
-            AddBuiltInEffect(results, "player_hunger_strike", "Player Hunger Strike", "Set hunger and hydration to zero.", 125);
+            AddBuiltInEffect(results, "player_kill", "Player Kill", "Instantly kill the player.", 2000);
+            AddBuiltInEffect(results, "player_hunger_strike", "Player Hunger Strike", "Set hunger and hydration to zero.", 250);
             AddBuiltInEffect(results, "player_fill_hunger", "Fill Hunger", "Restore hunger and hydration.", 100);
-            AddBuiltInEffect(results, "player_full_heal", "Full Heal", "Fully heal the player and clear bleeding.", 125);
+            AddBuiltInEffect(results, "player_full_heal", "Full Heal", "Fully heal the player and clear bleeding.", 200);
             AddBuiltInEffect(results, "give_fuel", "Give Fuel", "Give low grade fuel to the player.", 100);
             AddBuiltInEffect(results, "give_hazmat", "Give Hazmat", "Give a hazmat suit.", 150);
             AddBuiltInEffect(results, "give_armor_kit", "Give Armor Kit", "Give an armor clothing set.", 175);
