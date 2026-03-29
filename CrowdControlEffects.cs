@@ -15,7 +15,7 @@ namespace Oxide.Plugins
     /// Built-in rows are defined as <c>BuiltInEffectMeta</c> entries in <c>BuiltInEffectCatalog</c> (Built-in effect catalog region): effect id, display name,
     /// description, default price, optional menu duration string (if omitted but <c>timedFallbackDurationSeconds</c> is set, menu duration is derived), optional timed Pub/Sub fallback seconds, and optional <c>worldEffect</c> (no per-player broadcast fan-out). <c>player_fire</c> uses a separate burn timed lifecycle.
     /// </remarks>
-    [Info("CrowdControlEffects", "Warp World", "1.0.5")]
+    [Info("CrowdControlEffects", "Warp World", "1.0.6")]
     [Description("Built-in Crowd Control Rust effect provider.")]
     public class CrowdControlEffects : RustPlugin
     {
@@ -205,7 +205,7 @@ namespace Oxide.Plugins
                 new BuiltInEffectMeta("give_sleeping_bag", "Give Sleeping Bag", "Give a sleeping bag item.", 125),
                 new BuiltInEffectMeta("player_drop_hotbar_item", "Player Drop Hotbar Item", "Drop held hotbar item.", 125),
                 new BuiltInEffectMeta("give_scrap_bonus", "Give Scrap Bonus", "Give scrap to the player.", 100),
-                new BuiltInEffectMeta("player_scrap_tax", "Player Scrap Tax", "Take scrap from the player.", 100),
+                new BuiltInEffectMeta("player_scrap_tax", "Player Scrap Tax", "Remove a percentage of the player's scrap (default 10%; effect amount = percent 1–100).", 100),
                 new BuiltInEffectMeta("player_remove_med_items", "Player Remove Med Items", "Remove medical items from inventory.", 125),
                 new BuiltInEffectMeta("give_weapon_revolver", "Give Revolver", "Give revolver with ammo.", 125),
                 new BuiltInEffectMeta("give_bandage", "Give Bandage", "Give bandages to the player.", 50),
@@ -854,7 +854,7 @@ namespace Oxide.Plugins
                 case "give_scrap_bonus":
                     return TryGiveItem(player, "scrap", GetEffectAmount(effectPayload, 100), out error);
                 case "player_scrap_tax":
-                    return TryTakeItem(player, "scrap", GetEffectAmount(effectPayload, 100), out error);
+                    return TryTakeScrapTaxPercent(player, effectPayload, out error);
                 case "player_remove_med_items":
                     return TryRemoveMedicalItems(player, GetEffectAmount(effectPayload, 2), out error);
                 case "give_weapon_revolver":
@@ -1761,6 +1761,68 @@ namespace Oxide.Plugins
                     SendToast(p, 0, message);
                 }
             }
+        }
+
+        private bool TryTakeScrapTaxPercent(BasePlayer player, JObject effectPayload, out string error)
+        {
+            error = string.Empty;
+            var definition = ItemManager.FindItemDefinition("scrap");
+            if (definition == null)
+            {
+                error = "Scrap item definition is unavailable.";
+                return false;
+            }
+
+            var totalScrap = GetTotalItemAmountInPlayerInventory(player, definition.itemid);
+            if (totalScrap <= 0)
+            {
+                error = "Player has no scrap to tax.";
+                return false;
+            }
+
+            var percent = Mathf.Clamp(GetEffectAmount(effectPayload, 10), 1, 100);
+            var taxAmount = Mathf.FloorToInt(totalScrap * (percent / 100f));
+            taxAmount = Mathf.Clamp(Mathf.Max(1, taxAmount), 1, totalScrap);
+
+            var removed = player.inventory.Take(null, definition.itemid, taxAmount);
+            if (removed <= 0)
+            {
+                error = "Could not remove scrap from the player.";
+                return false;
+            }
+
+            return true;
+        }
+
+        private static int GetTotalItemAmountInPlayerInventory(BasePlayer player, int itemId)
+        {
+            if (player?.inventory == null)
+            {
+                return 0;
+            }
+
+            return GetItemAmountInContainer(player.inventory.containerMain, itemId) +
+                GetItemAmountInContainer(player.inventory.containerBelt, itemId) +
+                GetItemAmountInContainer(player.inventory.containerWear, itemId);
+        }
+
+        private static int GetItemAmountInContainer(ItemContainer container, int itemId)
+        {
+            if (container?.itemList == null)
+            {
+                return 0;
+            }
+
+            var sum = 0;
+            foreach (var item in container.itemList)
+            {
+                if (item != null && item.info != null && item.info.itemid == itemId)
+                {
+                    sum += item.amount;
+                }
+            }
+
+            return sum;
         }
 
         private bool TryTakeItem(BasePlayer player, string shortName, int amount, out string error)
