@@ -8,10 +8,19 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("CrowdControlEffects", "Warp World", "1.0.1")]
+    /// <summary>
+    /// Built-in Rust effects for Crowd Control. Registers with <c>CC_RegisterLocalEffects</c> and handles <c>OnCrowdControlEffect</c>.
+    /// </summary>
+    /// <remarks>
+    /// Built-in rows are defined as <c>BuiltInEffectMeta</c> entries in <c>BuiltInEffectCatalog</c> (Built-in effect catalog region): effect id, display name,
+    /// description, default price, optional menu duration string, and optional timed Pub/Sub fallback seconds. <c>player_fire</c> uses a separate burn timed lifecycle.
+    /// </remarks>
+    [Info("CrowdControlEffects", "Warp World", "1.0.2")]
     [Description("Built-in Crowd Control Rust effect provider.")]
     public class CrowdControlEffects : RustPlugin
     {
+        #region Fields and nested types
+
         [PluginReference]
         private Plugin CrowdControl;
 
@@ -43,6 +52,10 @@ namespace Oxide.Plugins
             public Oxide.Plugins.Timer EnforceTimer;
             public Oxide.Plugins.Timer EndTimer;
         }
+
+        #endregion
+
+        #region Oxide hooks
 
         private void OnServerInitialized()
         {
@@ -120,6 +133,158 @@ namespace Oxide.Plugins
             return null;
         }
 
+        #endregion
+
+        #region Built-in effect catalog
+
+        /// <summary>
+        /// One row in the static <c>BuiltInEffectCatalog</c> array. <see cref="MenuDurationValue"/> is the Crowd Control menu duration token (e.g. <c>0:0:15.0</c>).
+        /// <see cref="TimedFallbackDurationSeconds"/> when set selects timed Pub/Sub lifecycle and supplies seconds when the request has no parseable duration.
+        /// </summary>
+        private sealed class BuiltInEffectMeta
+        {
+            public BuiltInEffectMeta(
+                string effectId,
+                string displayName,
+                string description,
+                int price,
+                string menuDurationValue = null,
+                int? timedFallbackDurationSeconds = null)
+            {
+                EffectId = effectId ?? string.Empty;
+                DisplayName = displayName ?? string.Empty;
+                Description = description ?? string.Empty;
+                Price = price;
+                MenuDurationValue = menuDurationValue;
+                TimedFallbackDurationSeconds = timedFallbackDurationSeconds;
+            }
+
+            public string EffectId { get; }
+            public string DisplayName { get; }
+            public string Description { get; }
+            public int Price { get; }
+            public string MenuDurationValue { get; }
+            public int? TimedFallbackDurationSeconds { get; }
+        }
+
+        private static BuiltInEffectMeta[] CreateBuiltInEffectCatalog()
+        {
+            return new[]
+            {
+                new BuiltInEffectMeta("player_kill", "Player Kill", "Instantly kill the player.", 2000),
+                new BuiltInEffectMeta("player_hunger_strike", "Player Hunger Strike", "Set hunger and hydration to zero.", 250),
+                new BuiltInEffectMeta("player_fill_hunger", "Fill Hunger", "Restore hunger and hydration.", 100),
+                new BuiltInEffectMeta("player_full_heal", "Full Heal", "Fully heal the player and clear bleeding.", 200),
+                new BuiltInEffectMeta("give_fuel", "Give Fuel", "Give low grade fuel to the player.", 100),
+                new BuiltInEffectMeta("give_hazmat", "Give Hazmat", "Give a hazmat suit.", 150),
+                new BuiltInEffectMeta("give_armor_kit", "Give Armor Kit", "Give an armor clothing set.", 175),
+                new BuiltInEffectMeta("player_strip_armor", "Strip Armor", "Remove worn armor/clothing.", 150),
+                new BuiltInEffectMeta("player_break_armor", "Break Armor", "Destroy armor durability.", 175),
+                new BuiltInEffectMeta("world_set_day", "Set Day", "Set world time to day.", 150),
+                new BuiltInEffectMeta("world_set_night", "Set Night", "Set world time to night.", 150),
+                new BuiltInEffectMeta("player_hurt", "Player Hurt", "Deal light damage to the player.", 75),
+                new BuiltInEffectMeta("player_handcuff", "Handcuff Player", "Immobilize the player briefly.", 175, "0:0:12.0", 12),
+                new BuiltInEffectMeta("player_fire", "Player Fire", "Set the player on fire briefly.", 225),
+                new BuiltInEffectMeta("player_heal", "Player Heal", "Heal a small amount.", 75),
+                new BuiltInEffectMeta("player_drop_item", "Player Drop Item", "Drop active inventory item.", 100),
+                new BuiltInEffectMeta("player_drop_some", "Player Drop Some", "Drop roughly half of inventory items.", 175),
+                new BuiltInEffectMeta("player_drop_all", "Player Drop All", "Drop all inventory items.", 325),
+                new BuiltInEffectMeta("player_unload_ammo", "Player Unload Ammo", "Unload active weapon ammo.", 100),
+                new BuiltInEffectMeta("give_item_wood", "Give Wood", "Give wood resources.", 50),
+                new BuiltInEffectMeta("give_item_stone", "Give Stone", "Give stone resources.", 50),
+                new BuiltInEffectMeta("give_item_metal_fragments", "Give Metal Fragments", "Give metal fragments.", 75),
+                new BuiltInEffectMeta("give_item_sulfur_ore", "Give Sulfur Ore", "Give sulfur ore.", 100),
+                new BuiltInEffectMeta("give_torch", "Give Torch", "Give a torch.", 50),
+                new BuiltInEffectMeta("give_rock", "Give Rock", "Give a rock.", 50),
+                new BuiltInEffectMeta("give_sleeping_bag", "Give Sleeping Bag", "Give a sleeping bag item.", 125),
+                new BuiltInEffectMeta("player_drop_hotbar_item", "Player Drop Hotbar Item", "Drop held hotbar item.", 125),
+                new BuiltInEffectMeta("give_scrap_bonus", "Give Scrap Bonus", "Give scrap to the player.", 100),
+                new BuiltInEffectMeta("player_scrap_tax", "Player Scrap Tax", "Take scrap from the player.", 100),
+                new BuiltInEffectMeta("player_remove_med_items", "Player Remove Med Items", "Remove medical items from inventory.", 125),
+                new BuiltInEffectMeta("give_weapon_revolver", "Give Revolver", "Give revolver with ammo.", 125),
+                new BuiltInEffectMeta("give_bandage", "Give Bandage", "Give bandages to the player.", 50),
+                new BuiltInEffectMeta("give_syringe", "Give Syringe", "Give medical syringes to the player.", 75),
+                new BuiltInEffectMeta("give_large_medkit", "Give Large Medkit", "Give a large medkit to the player.", 100),
+                new BuiltInEffectMeta("give_weapon_pumpshotgun", "Give Pump Shotgun", "Give pump shotgun with ammo.", 175),
+                new BuiltInEffectMeta("give_weapon_ak", "Give AK", "Give AK with ammo.", 350),
+                new BuiltInEffectMeta("give_weapon_thompson", "Give Thompson", "Give Thompson with ammo.", 225),
+                new BuiltInEffectMeta("give_weapon_rpg", "Give RPG", "Give RPG with rockets.", 425),
+                new BuiltInEffectMeta("give_weapon_grenade_f1", "Give F1 Grenades", "Give F1 grenades.", 150),
+                new BuiltInEffectMeta("give_weapon_grenade_beancan", "Give Beancan Grenades", "Give beancan grenades.", 150),
+                new BuiltInEffectMeta("give_weapon_mgl", "Give MGL", "Give MGL with 40mm ammo.", 425),
+                new BuiltInEffectMeta("give_explosive_satchel", "Give Satchel Charges", "Give satchel charges.", 325),
+                new BuiltInEffectMeta("give_explosive_timed", "Give C4 (Timed Explosive)", "Give timed explosive charges (C4).", 650),
+                new BuiltInEffectMeta("give_ammo_pistol", "Give Pistol Ammo", "Give pistol ammo.", 75),
+                new BuiltInEffectMeta("give_ammo_pistol_hv", "Give Pistol HV Ammo", "Give high velocity pistol ammo.", 100),
+                new BuiltInEffectMeta("give_ammo_pistol_incendiary", "Give Pistol Incendiary Ammo", "Give incendiary pistol ammo.", 125),
+                new BuiltInEffectMeta("give_ammo_rifle", "Give Rifle Ammo", "Give rifle ammo.", 100),
+                new BuiltInEffectMeta("give_ammo_rifle_hv", "Give Rifle HV Ammo", "Give high velocity rifle ammo.", 150),
+                new BuiltInEffectMeta("give_ammo_rifle_incendiary", "Give Rifle Incendiary Ammo", "Give incendiary rifle ammo.", 175),
+                new BuiltInEffectMeta("give_ammo_shotgun_buckshot", "Give Buckshot Ammo", "Give shotgun buckshot ammo.", 100),
+                new BuiltInEffectMeta("give_ammo_shotgun_slug", "Give Shotgun Slug Ammo", "Give shotgun slug ammo.", 100),
+                new BuiltInEffectMeta("give_ammo_shotgun_incendiary", "Give Shotgun Incendiary Ammo", "Give incendiary shotgun ammo.", 125),
+                new BuiltInEffectMeta("give_ammo_rockets", "Give Rockets", "Give basic rockets.", 225),
+                new BuiltInEffectMeta("give_airdrop_signal", "Give Airdrop Signal", "Give a supply signal.", 175),
+                new BuiltInEffectMeta("spawn_minicopter", "Spawn Minicopter", "Spawn a minicopter nearby.", 250),
+                new BuiltInEffectMeta("spawn_supply_drop", "Spawn Supply Drop", "Spawn a supply drop nearby.", 250),
+                new BuiltInEffectMeta("spawn_attack_helicopter", "Spawn Attack Helicopter", "Spawn an attack helicopter nearby.", 500),
+                new BuiltInEffectMeta("spawn_nodes", "Spawn Nodes", "Spawn random ore nodes around the player on safe ground.", 250),
+                new BuiltInEffectMeta("spawn_nodes_stone", "Spawn Stone Nodes", "Spawn stone ore nodes around the player on safe ground.", 250),
+                new BuiltInEffectMeta("spawn_nodes_metal", "Spawn Metal Nodes", "Spawn metal ore nodes around the player on safe ground.", 275),
+                new BuiltInEffectMeta("spawn_nodes_sulfur", "Spawn Sulfur Nodes", "Spawn sulfur ore nodes around the player on safe ground.", 325),
+                new BuiltInEffectMeta("spawn_sleeping_bag_here", "Spawn Sleeping Bag Here", "Force-place a sleeping bag at the player's current position.", 175),
+                new BuiltInEffectMeta("test_hype_train", "TEST: Hype Train", "Test effect: spawn a short-lived hype train with stub rider names and sound.", 25),
+                new BuiltInEffectMeta("player_teleport_to_sleeping_bag", "Teleport To Sleeping Bag", "Teleport player to one of their sleeping bags.", 225),
+                new BuiltInEffectMeta("player_teleport_to_cc_player", "Teleport To CC Player", "Teleport to another active CC player.", 150),
+                new BuiltInEffectMeta("player_teleport_swap_cc_player", "Teleport Swap CC Player", "Swap position with another active CC player.", 175),
+                new BuiltInEffectMeta("player_reload_active_weapon", "Reload Active Weapon", "Reload the active weapon.", 100),
+                new BuiltInEffectMeta("player_drain_active_weapon_ammo", "Drain Active Weapon Ammo", "Drain ammo from active weapon.", 125),
+                new BuiltInEffectMeta("player_bleed", "Player Bleed", "Increase player bleeding.", 125),
+                new BuiltInEffectMeta("player_fracture", "Player Fracture", "Apply fracture-like penalty.", 150),
+                new BuiltInEffectMeta("player_freeze_short", "Player Freeze Short", "Freeze movement briefly.", 150),
+                new BuiltInEffectMeta("player_god_mode_15s", "Player God Mode (15s)", "Temporary god mode for 15 seconds.", 250, "0:0:15.0"),
+                new BuiltInEffectMeta("player_fly_mode_15s", "Player Fly Mode (15s)", "Temporary fly mode for 15 seconds.", 250, "0:0:15.0"),
+                new BuiltInEffectMeta("player_admin_power_15s", "Player Admin Power (15s)", "Temporary god+fly for 15 seconds.", 400, "0:0:15.0"),
+                new BuiltInEffectMeta("player_revive", "Player Revive", "Revive player at last death location.", 250),
+                new BuiltInEffectMeta("player_damage_over_time", "Player Damage Over Time", "Apply timed damage-over-time.", 175, "0:0:15.0", 15),
+                new BuiltInEffectMeta("player_heal_over_time", "Player Heal Over Time", "Apply timed healing-over-time.", 175, "0:0:15.0", 15),
+                new BuiltInEffectMeta("spawn_testridablehorse", "Spawn Horse", "Spawn a ridable horse near player.", 175),
+                new BuiltInEffectMeta("spawn_boar", "Spawn Boar", "Spawn a boar near player.", 150),
+                new BuiltInEffectMeta("spawn_wolf", "Spawn Wolf", "Spawn a wolf near player.", 175),
+                new BuiltInEffectMeta("spawn_wolves", "Spawn Wolves", "Spawn a wolf pack nearby.", 250),
+                new BuiltInEffectMeta("spawn_bear", "Spawn Bear", "Spawn a bear near player.", 225),
+                new BuiltInEffectMeta("spawn_chicken", "Spawn Chicken", "Spawn a chicken near player.", 100),
+                new BuiltInEffectMeta("spawn_stag", "Spawn Stag", "Spawn a stag near player.", 150),
+                new BuiltInEffectMeta("spawn_scarecrow", "Spawn Zombie (Scarecrow)", "Spawn a scarecrow zombie near player.", 200),
+                new BuiltInEffectMeta("spawn_scarecrows", "Spawn Zombies (Scarecrows)", "Spawn a zombie pack near player.", 350),
+                new BuiltInEffectMeta("spawn_simpleshark", "Spawn Shark", "Spawn a shark near player.", 250),
+                new BuiltInEffectMeta("spawn_scientistnpc", "Spawn Scientist NPC", "Spawn a scientist NPC near player.", 250),
+                new BuiltInEffectMeta("spawn_pedalbike", "Spawn Pedal Bike", "Spawn a pedal bike near player.", 200),
+                new BuiltInEffectMeta("spawn_motorbike", "Spawn Motorbike", "Spawn a motorbike near player.", 225),
+                new BuiltInEffectMeta("spawn_vehicle_car_small", "Spawn Small Car", "Spawn a small drivable modular car.", 325),
+                new BuiltInEffectMeta("spawn_vehicle_car_large", "Spawn Large Car", "Spawn a large drivable modular car.", 375),
+                new BuiltInEffectMeta("spawn_vehicle_truck", "Spawn Truck", "Spawn a drivable truck.", 375),
+                new BuiltInEffectMeta("spawn_rowboat", "Spawn Rowboat", "Spawn a rowboat near player.", 250),
+                new BuiltInEffectMeta("spawn_rhib", "Spawn RHIB", "Spawn a RHIB near player.", 325),
+                new BuiltInEffectMeta("spawn_scraptransporthelicopter", "Spawn Scrap Transport Helicopter", "Spawn a scrap transport helicopter near player.", 500)
+            };
+        }
+
+        private static readonly BuiltInEffectMeta[] BuiltInEffectCatalog = CreateBuiltInEffectCatalog();
+
+        private static readonly Dictionary<string, BuiltInEffectMeta> BuiltInEffectsById = BuildBuiltInEffectsById(BuiltInEffectCatalog);
+
+        private static Dictionary<string, BuiltInEffectMeta> BuildBuiltInEffectsById(BuiltInEffectMeta[] entries)
+        {
+            var map = new Dictionary<string, BuiltInEffectMeta>(StringComparer.OrdinalIgnoreCase);
+            foreach (var entry in entries)
+            {
+                map[entry.EffectId] = entry;
+            }
+
+            return map;
+        }
+
         private void RegisterBuiltInEffects()
         {
             if (CrowdControl == null)
@@ -167,131 +332,44 @@ namespace Oxide.Plugins
         private JArray LoadBuiltInEffects()
         {
             var results = new JArray();
-            AddBuiltInEffect(results, "player_kill", "Player Kill", "Instantly kill the player.", 2000);
-            AddBuiltInEffect(results, "player_hunger_strike", "Player Hunger Strike", "Set hunger and hydration to zero.", 250);
-            AddBuiltInEffect(results, "player_fill_hunger", "Fill Hunger", "Restore hunger and hydration.", 100);
-            AddBuiltInEffect(results, "player_full_heal", "Full Heal", "Fully heal the player and clear bleeding.", 200);
-            AddBuiltInEffect(results, "give_fuel", "Give Fuel", "Give low grade fuel to the player.", 100);
-            AddBuiltInEffect(results, "give_hazmat", "Give Hazmat", "Give a hazmat suit.", 150);
-            AddBuiltInEffect(results, "give_armor_kit", "Give Armor Kit", "Give an armor clothing set.", 175);
-            AddBuiltInEffect(results, "player_strip_armor", "Strip Armor", "Remove worn armor/clothing.", 150);
-            AddBuiltInEffect(results, "player_break_armor", "Break Armor", "Destroy armor durability.", 175);
-            AddBuiltInEffect(results, "world_set_day", "Set Day", "Set world time to day.", 150);
-            AddBuiltInEffect(results, "world_set_night", "Set Night", "Set world time to night.", 150);
-            AddBuiltInEffect(results, "player_hurt", "Player Hurt", "Deal light damage to the player.", 75);
-            AddBuiltInEffect(results, "player_handcuff", "Handcuff Player", "Immobilize the player briefly.", 175, "0:0:12.0");
-            AddBuiltInEffect(results, "player_fire", "Player Fire", "Set the player on fire briefly.", 225);
-            AddBuiltInEffect(results, "player_heal", "Player Heal", "Heal a small amount.", 75);
-            AddBuiltInEffect(results, "player_drop_item", "Player Drop Item", "Drop active inventory item.", 100);
-            AddBuiltInEffect(results, "player_drop_some", "Player Drop Some", "Drop roughly half of inventory items.", 175);
-            AddBuiltInEffect(results, "player_drop_all", "Player Drop All", "Drop all inventory items.", 325);
-            AddBuiltInEffect(results, "player_unload_ammo", "Player Unload Ammo", "Unload active weapon ammo.", 100);
-            AddBuiltInEffect(results, "give_item_wood", "Give Wood", "Give wood resources.", 50);
-            AddBuiltInEffect(results, "give_item_stone", "Give Stone", "Give stone resources.", 50);
-            AddBuiltInEffect(results, "give_item_metal_fragments", "Give Metal Fragments", "Give metal fragments.", 75);
-            AddBuiltInEffect(results, "give_item_sulfur_ore", "Give Sulfur Ore", "Give sulfur ore.", 100);
-            AddBuiltInEffect(results, "give_torch", "Give Torch", "Give a torch.", 50);
-            AddBuiltInEffect(results, "give_rock", "Give Rock", "Give a rock.", 50);
-            AddBuiltInEffect(results, "give_sleeping_bag", "Give Sleeping Bag", "Give a sleeping bag item.", 125);
-            AddBuiltInEffect(results, "player_drop_hotbar_item", "Player Drop Hotbar Item", "Drop held hotbar item.", 125);
-            AddBuiltInEffect(results, "give_scrap_bonus", "Give Scrap Bonus", "Give scrap to the player.", 100);
-            AddBuiltInEffect(results, "player_scrap_tax", "Player Scrap Tax", "Take scrap from the player.", 100);
-            AddBuiltInEffect(results, "player_remove_med_items", "Player Remove Med Items", "Remove medical items from inventory.", 125);
-            AddBuiltInEffect(results, "give_weapon_revolver", "Give Revolver", "Give revolver with ammo.", 125);
-            AddBuiltInEffect(results, "give_bandage", "Give Bandage", "Give bandages to the player.", 50);
-            AddBuiltInEffect(results, "give_syringe", "Give Syringe", "Give medical syringes to the player.", 75);
-            AddBuiltInEffect(results, "give_large_medkit", "Give Large Medkit", "Give a large medkit to the player.", 100);
-            AddBuiltInEffect(results, "give_weapon_pumpshotgun", "Give Pump Shotgun", "Give pump shotgun with ammo.", 175);
-            AddBuiltInEffect(results, "give_weapon_ak", "Give AK", "Give AK with ammo.", 350);
-            AddBuiltInEffect(results, "give_weapon_thompson", "Give Thompson", "Give Thompson with ammo.", 225);
-            AddBuiltInEffect(results, "give_weapon_rpg", "Give RPG", "Give RPG with rockets.", 425);
-            AddBuiltInEffect(results, "give_weapon_grenade_f1", "Give F1 Grenades", "Give F1 grenades.", 150);
-            AddBuiltInEffect(results, "give_weapon_grenade_beancan", "Give Beancan Grenades", "Give beancan grenades.", 150);
-            AddBuiltInEffect(results, "give_weapon_mgl", "Give MGL", "Give MGL with 40mm ammo.", 425);
-            AddBuiltInEffect(results, "give_explosive_satchel", "Give Satchel Charges", "Give satchel charges.", 325);
-            AddBuiltInEffect(results, "give_explosive_timed", "Give C4 (Timed Explosive)", "Give timed explosive charges (C4).", 650);
-            AddBuiltInEffect(results, "give_ammo_pistol", "Give Pistol Ammo", "Give pistol ammo.", 75);
-            AddBuiltInEffect(results, "give_ammo_pistol_hv", "Give Pistol HV Ammo", "Give high velocity pistol ammo.", 100);
-            AddBuiltInEffect(results, "give_ammo_pistol_incendiary", "Give Pistol Incendiary Ammo", "Give incendiary pistol ammo.", 125);
-            AddBuiltInEffect(results, "give_ammo_rifle", "Give Rifle Ammo", "Give rifle ammo.", 100);
-            AddBuiltInEffect(results, "give_ammo_rifle_hv", "Give Rifle HV Ammo", "Give high velocity rifle ammo.", 150);
-            AddBuiltInEffect(results, "give_ammo_rifle_incendiary", "Give Rifle Incendiary Ammo", "Give incendiary rifle ammo.", 175);
-            AddBuiltInEffect(results, "give_ammo_shotgun_buckshot", "Give Buckshot Ammo", "Give shotgun buckshot ammo.", 100);
-            AddBuiltInEffect(results, "give_ammo_shotgun_slug", "Give Shotgun Slug Ammo", "Give shotgun slug ammo.", 100);
-            AddBuiltInEffect(results, "give_ammo_shotgun_incendiary", "Give Shotgun Incendiary Ammo", "Give incendiary shotgun ammo.", 125);
-            AddBuiltInEffect(results, "give_ammo_rockets", "Give Rockets", "Give basic rockets.", 225);
-            AddBuiltInEffect(results, "give_airdrop_signal", "Give Airdrop Signal", "Give a supply signal.", 175);
-            AddBuiltInEffect(results, "spawn_minicopter", "Spawn Minicopter", "Spawn a minicopter nearby.", 250);
-            AddBuiltInEffect(results, "spawn_supply_drop", "Spawn Supply Drop", "Spawn a supply drop nearby.", 250);
-            AddBuiltInEffect(results, "spawn_attack_helicopter", "Spawn Attack Helicopter", "Spawn an attack helicopter nearby.", 500);
-            AddBuiltInEffect(results, "spawn_nodes", "Spawn Nodes", "Spawn random ore nodes around the player on safe ground.", 250);
-            AddBuiltInEffect(results, "spawn_nodes_stone", "Spawn Stone Nodes", "Spawn stone ore nodes around the player on safe ground.", 250);
-            AddBuiltInEffect(results, "spawn_nodes_metal", "Spawn Metal Nodes", "Spawn metal ore nodes around the player on safe ground.", 275);
-            AddBuiltInEffect(results, "spawn_nodes_sulfur", "Spawn Sulfur Nodes", "Spawn sulfur ore nodes around the player on safe ground.", 325);
-            AddBuiltInEffect(results, "spawn_sleeping_bag_here", "Spawn Sleeping Bag Here", "Force-place a sleeping bag at the player's current position.", 175);
-            // AddBuiltInEffect(results, "test_hype_train", "TEST: Hype Train", "Test effect: spawn a short-lived hype train with stub rider names and sound.", 25);
-            AddBuiltInEffect(results, "player_teleport_to_sleeping_bag", "Teleport To Sleeping Bag", "Teleport player to one of their sleeping bags.", 225);
-            AddBuiltInEffect(results, "player_teleport_to_cc_player", "Teleport To CC Player", "Teleport to another active CC player.", 150);
-            AddBuiltInEffect(results, "player_teleport_swap_cc_player", "Teleport Swap CC Player", "Swap position with another active CC player.", 175);
-            AddBuiltInEffect(results, "player_reload_active_weapon", "Reload Active Weapon", "Reload the active weapon.", 100);
-            AddBuiltInEffect(results, "player_drain_active_weapon_ammo", "Drain Active Weapon Ammo", "Drain ammo from active weapon.", 125);
-            AddBuiltInEffect(results, "player_bleed", "Player Bleed", "Increase player bleeding.", 125);
-            AddBuiltInEffect(results, "player_fracture", "Player Fracture", "Apply fracture-like penalty.", 150);
-            AddBuiltInEffect(results, "player_freeze_short", "Player Freeze Short", "Freeze movement briefly.", 150);
-            AddBuiltInEffect(results, "player_god_mode_15s", "Player God Mode (15s)", "Temporary god mode for 15 seconds.", 250, "0:0:15.0");
-            AddBuiltInEffect(results, "player_fly_mode_15s", "Player Fly Mode (15s)", "Temporary fly mode for 15 seconds.", 250, "0:0:15.0");
-            AddBuiltInEffect(results, "player_admin_power_15s", "Player Admin Power (15s)", "Temporary god+fly for 15 seconds.", 400, "0:0:15.0");
-            AddBuiltInEffect(results, "player_revive", "Player Revive", "Revive player at last death location.", 250);
-            AddBuiltInEffect(results, "player_damage_over_time", "Player Damage Over Time", "Apply timed damage-over-time.", 175, "0:0:15.0");
-            AddBuiltInEffect(results, "player_heal_over_time", "Player Heal Over Time", "Apply timed healing-over-time.", 175, "0:0:15.0");
-            AddBuiltInEffect(results, "spawn_testridablehorse", "Spawn Horse", "Spawn a ridable horse near player.", 175);
-            AddBuiltInEffect(results, "spawn_boar", "Spawn Boar", "Spawn a boar near player.", 150);
-            AddBuiltInEffect(results, "spawn_wolf", "Spawn Wolf", "Spawn a wolf near player.", 175);
-            AddBuiltInEffect(results, "spawn_wolves", "Spawn Wolves", "Spawn a wolf pack nearby.", 250);
-            AddBuiltInEffect(results, "spawn_bear", "Spawn Bear", "Spawn a bear near player.", 225);
-            AddBuiltInEffect(results, "spawn_chicken", "Spawn Chicken", "Spawn a chicken near player.", 100);
-            AddBuiltInEffect(results, "spawn_stag", "Spawn Stag", "Spawn a stag near player.", 150);
-            AddBuiltInEffect(results, "spawn_scarecrow", "Spawn Zombie (Scarecrow)", "Spawn a scarecrow zombie near player.", 200);
-            AddBuiltInEffect(results, "spawn_scarecrows", "Spawn Zombies (Scarecrows)", "Spawn a zombie pack near player.", 350);
-            AddBuiltInEffect(results, "spawn_simpleshark", "Spawn Shark", "Spawn a shark near player.", 250);
-            AddBuiltInEffect(results, "spawn_scientistnpc", "Spawn Scientist NPC", "Spawn a scientist NPC near player.", 250);
-            AddBuiltInEffect(results, "spawn_pedalbike", "Spawn Pedal Bike", "Spawn a pedal bike near player.", 200);
-            AddBuiltInEffect(results, "spawn_motorbike", "Spawn Motorbike", "Spawn a motorbike near player.", 225);
-            AddBuiltInEffect(results, "spawn_vehicle_car_small", "Spawn Small Car", "Spawn a small drivable modular car.", 325);
-            AddBuiltInEffect(results, "spawn_vehicle_car_large", "Spawn Large Car", "Spawn a large drivable modular car.", 375);
-            AddBuiltInEffect(results, "spawn_vehicle_truck", "Spawn Truck", "Spawn a drivable truck.", 375);
-            AddBuiltInEffect(results, "spawn_rowboat", "Spawn Rowboat", "Spawn a rowboat near player.", 250);
-            AddBuiltInEffect(results, "spawn_rhib", "Spawn RHIB", "Spawn a RHIB near player.", 325);
-            AddBuiltInEffect(results, "spawn_scraptransporthelicopter", "Spawn Scrap Transport Helicopter", "Spawn a scrap transport helicopter near player.", 500);
+            foreach (var meta in BuiltInEffectCatalog)
+            {
+                AppendBuiltInRegistration(results, meta);
+            }
+
             return results;
         }
 
-        private void AddBuiltInEffect(JArray results, string effectId, string name, string description, int price, string durationValue = null)
+        private void AppendBuiltInRegistration(JArray results, BuiltInEffectMeta meta)
         {
-            if (results == null || !IsSupportedBuiltInEffectId(effectId))
+            if (results == null || meta == null)
             {
                 return;
             }
 
             var registerObj = new JObject
             {
-                ["effectID"] = effectId,
-                ["name"] = name,
-                ["description"] = description,
-                ["price"] = Math.Max(0, price),
+                ["effectID"] = meta.EffectId,
+                ["name"] = meta.DisplayName,
+                ["description"] = meta.Description,
+                ["price"] = Math.Max(0, meta.Price),
                 ["syncMenu"] = false
             };
 
-            if (!string.IsNullOrWhiteSpace(durationValue))
+            if (!string.IsNullOrWhiteSpace(meta.MenuDurationValue))
             {
                 registerObj["duration"] = new JObject
                 {
-                    ["value"] = durationValue
+                    ["value"] = meta.MenuDurationValue
                 };
             }
 
             results.Add(registerObj);
         }
+
+        #endregion
+
+        #region Crowd Control provider (entry, timed effects, catalog helpers)
 
         [HookMethod("OnCrowdControlEffect")]
         private object OnCrowdControlEffect(JObject context)
@@ -306,7 +384,7 @@ namespace Oxide.Plugins
                 };
             }
 
-            if (string.Equals(effectId, "player_fire", StringComparison.OrdinalIgnoreCase))
+            if (effectId == "player_fire")
             {
                 return StartCrowdControlledBurnEffect(context);
             }
@@ -530,9 +608,7 @@ namespace Oxide.Plugins
 
         private bool IsTimedEffect(string effectId)
         {
-            return string.Equals(effectId, "player_handcuff", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(effectId, "player_damage_over_time", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(effectId, "player_heal_over_time", StringComparison.OrdinalIgnoreCase);
+            return TryGetBuiltInEffectMeta(NormalizeEffectId(effectId), out var meta) && meta.TimedFallbackDurationSeconds.HasValue;
         }
 
         private bool TryStartTimedEffectBehavior(TimedEffectState state, BasePlayer player, int durationSeconds, out string error)
@@ -644,92 +720,36 @@ namespace Oxide.Plugins
                 status);
         }
 
+        private static bool TryGetBuiltInEffectMeta(string normalizedEffectId, out BuiltInEffectMeta meta)
+        {
+            meta = null;
+            if (string.IsNullOrEmpty(normalizedEffectId))
+            {
+                return false;
+            }
+
+            return BuiltInEffectsById.TryGetValue(normalizedEffectId, out meta);
+        }
+
         private bool IsSupportedBuiltInEffectId(string effectId)
         {
-            switch (NormalizeEffectId(effectId))
+            if (string.IsNullOrWhiteSpace(effectId))
             {
-                case "player_kill":
-                case "player_hunger_strike":
-                case "player_fill_hunger":
-                case "player_full_heal":
-                case "give_fuel":
-                case "give_hazmat":
-                case "give_armor_kit":
-                case "player_strip_armor":
-                case "player_break_armor":
-                case "world_set_day":
-                case "world_set_night":
-                case "player_hurt":
-                case "player_handcuff":
-                case "player_fire":
-                case "player_heal":
-                case "player_drop_item":
-                case "player_drop_some":
-                case "player_drop_all":
-                case "player_unload_ammo":
-                case "give_item_wood":
-                case "give_item_stone":
-                case "give_item_metal_fragments":
-                case "give_item_sulfur_ore":
-                case "give_torch":
-                case "give_rock":
-                case "give_sleeping_bag":
-                case "player_drop_hotbar_item":
-                case "give_scrap_bonus":
-                case "player_scrap_tax":
-                case "player_remove_med_items":
-                case "give_weapon_revolver":
-                case "give_bandage":
-                case "give_syringe":
-                case "give_large_medkit":
-                case "give_weapon_pumpshotgun":
-                case "give_weapon_ak":
-                case "give_weapon_thompson":
-                case "give_weapon_rpg":
-                case "give_weapon_grenade_f1":
-                case "give_weapon_grenade_beancan":
-                case "give_weapon_mgl":
-                case "give_explosive_satchel":
-                case "give_explosive_timed":
-                case "give_ammo_pistol":
-                case "give_ammo_pistol_hv":
-                case "give_ammo_pistol_incendiary":
-                case "give_ammo_rifle":
-                case "give_ammo_rifle_hv":
-                case "give_ammo_rifle_incendiary":
-                case "give_ammo_shotgun_buckshot":
-                case "give_ammo_shotgun_slug":
-                case "give_ammo_shotgun_incendiary":
-                case "give_ammo_rockets":
-                case "give_airdrop_signal":
-                case "spawn_minicopter":
-                case "spawn_supply_drop":
-                case "spawn_attack_helicopter":
-                case "spawn_nodes":
-                case "spawn_nodes_stone":
-                case "spawn_nodes_metal":
-                case "spawn_nodes_sulfur":
-                case "spawn_sleeping_bag_here":
-                case "test_hype_train":
-                case "player_teleport_to_sleeping_bag":
-                case "player_teleport_to_cc_player":
-                case "player_teleport_swap_cc_player":
-                case "player_reload_active_weapon":
-                case "player_drain_active_weapon_ammo":
-                case "player_bleed":
-                case "player_fracture":
-                case "player_freeze_short":
-                case "player_god_mode_15s":
-                case "player_fly_mode_15s":
-                case "player_admin_power_15s":
-                case "player_revive":
-                case "player_damage_over_time":
-                case "player_heal_over_time":
-                    return true;
-                default:
-                    return IsGenericSpawnEffect(NormalizeEffectId(effectId));
+                return false;
             }
+
+            var normalized = NormalizeEffectId(effectId);
+            if (BuiltInEffectsById.ContainsKey(normalized))
+            {
+                return true;
+            }
+
+            return IsGenericSpawnEffect(normalized);
         }
+
+        #endregion
+
+        #region Instant effects and gameplay implementations
 
         private bool TryApplyInstantEffect(BasePlayer player, string effectId, JObject requestPayload, JObject effectPayload, out string error)
         {
@@ -775,10 +795,6 @@ namespace Oxide.Plugins
                 case "player_hurt":
                     player.Hurt(25f);
                     return true;
-                case "player_handcuff":
-                    return TryHandcuffPlayer(player, GetEffectAmount(effectPayload, 12), out error);
-                case "player_fire":
-                    return TrySetPlayerOnFire(player, GetEffectAmount(effectPayload, 5), out error, crowdControlRequestId: null);
                 case "player_heal":
                     return TryHealPlayer(player, 25f, out error);
                 case "player_drop_item":
@@ -3341,6 +3357,10 @@ namespace Oxide.Plugins
             return false;
         }
 
+        #endregion
+
+        #region Helpers (logging, duration, player lookup)
+
         private void LogVerbose(string message)
         {
             if (VerboseLogging)
@@ -3349,80 +3369,53 @@ namespace Oxide.Plugins
             }
         }
 
+        private int ReadDurationSecondsFromCrowdControlPlugin(JObject effectPayload)
+        {
+            if (effectPayload == null || CrowdControl == null)
+            {
+                return 0;
+            }
+
+            object raw;
+            try
+            {
+                raw = CrowdControl.Call("CC_ParseEffectDurationSeconds", effectPayload);
+            }
+            catch
+            {
+                return 0;
+            }
+
+            if (raw == null)
+            {
+                return 0;
+            }
+
+            try
+            {
+                var n = Convert.ToInt32(raw);
+                return n > 0 ? n : 0;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
         private int GetTimedEffectDurationSeconds(JObject effectPayload, string effectId)
         {
-            var durationToken = effectPayload?["duration"];
-            if (durationToken != null && durationToken.Type != JTokenType.Null)
+            var fromPayload = ReadDurationSecondsFromCrowdControlPlugin(effectPayload);
+            if (fromPayload > 0)
             {
-                if (durationToken.Type == JTokenType.Integer || durationToken.Type == JTokenType.Float)
-                {
-                    try
-                    {
-                        var n = durationToken.ToObject<double>();
-                        if (n > 0d)
-                        {
-                            return Mathf.Max(1, Mathf.RoundToInt((float)n));
-                        }
-                    }
-                    catch
-                    {
-                        // fall through
-                    }
-                }
-
-                if (durationToken.Type == JTokenType.String &&
-                    double.TryParse(durationToken.Value<string>(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var parsedTop) &&
-                    parsedTop > 0d)
-                {
-                    return Mathf.Max(1, Mathf.RoundToInt((float)parsedTop));
-                }
+                return fromPayload;
             }
 
-            if (durationToken is JObject durationObj)
+            if (TryGetBuiltInEffectMeta(NormalizeEffectId(effectId), out var meta) && meta.TimedFallbackDurationSeconds.HasValue)
             {
-                var durationSeconds = durationObj.Value<int?>("seconds") ?? 0;
-                if (durationSeconds > 0)
-                {
-                    return durationSeconds;
-                }
-
-                var valueTok = durationObj["value"];
-                if (valueTok != null && valueTok.Type != JTokenType.Null)
-                {
-                    if (valueTok.Type == JTokenType.Integer || valueTok.Type == JTokenType.Float)
-                    {
-                        try
-                        {
-                            var n = valueTok.ToObject<double>();
-                            if (n > 0d)
-                            {
-                                return Mathf.Max(1, Mathf.RoundToInt((float)n));
-                            }
-                        }
-                        catch
-                        {
-                            // fall through
-                        }
-                    }
-
-                    var durationValue = valueTok.Type == JTokenType.String ? valueTok.Value<string>() : valueTok.ToString();
-                    if (!string.IsNullOrWhiteSpace(durationValue) && TimeSpan.TryParse(durationValue, out var parsedDuration))
-                    {
-                        return Mathf.Max(1, Mathf.RoundToInt((float)parsedDuration.TotalSeconds));
-                    }
-                }
+                return meta.TimedFallbackDurationSeconds.Value;
             }
 
-            switch (NormalizeEffectId(effectId))
-            {
-                case "player_handcuff":
-                    return 12;
-                case "player_damage_over_time":
-                case "player_heal_over_time":
-                    return 15;
-                default:
-                    return IsTimedEffect(effectId) ? 20 : 0;
-            }
+            return 0;
         }
 
         private BasePlayer FindPlayerBySteamId(string steamId)
@@ -3434,5 +3427,7 @@ namespace Oxide.Plugins
 
             return BasePlayer.FindByID(id) ?? BasePlayer.FindSleeping(id);
         }
+
+        #endregion
     }
 }
