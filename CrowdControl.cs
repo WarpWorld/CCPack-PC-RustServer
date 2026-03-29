@@ -14,10 +14,15 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("CrowdControl", "Warp World", "1.0.4")]
+    /// <summary>
+    /// Crowd Control integration for Rust: player linking, Pub/Sub WebSocket RPC, game sessions, retries, and a small public hook API (<c>CC_*</c>) for effect packs.
+    /// </summary>
+    [Info("CrowdControl", "Warp World", "1.0.5")]
     [Description("Crowd Control integration for Rust with auth, PubSub, and permission-based access controls.")]
     public class CrowdControl : RustPlugin
     {
+        #region Constants and fields
+
         private const string PermUse = "crowdcontrol.use";
         private const string PermAdmin = "crowdcontrol.admin";
         private const string PermIgnore = "crowdcontrol.ignore";
@@ -88,6 +93,8 @@ namespace Oxide.Plugins
         private volatile bool _isUnloading;
         private DateTime _lastSocketConnectUtc = DateTime.MinValue;
         private DateTime _lastSessionDisconnectToastUtc = DateTime.MinValue;
+
+        #endregion
 
         #region Models
 
@@ -935,6 +942,21 @@ namespace Oxide.Plugins
                 FireAndForget(SyncCustomEffectsForAllSessionsAsync(), "external effects unregister sync");
             }
             return removed > 0;
+        }
+
+        /// <summary>
+        /// Parses the <c>duration</c> field on a Crowd Control effect JSON object (same rules as inbound effect requests).
+        /// Returns seconds as a boxed int, or 0 if missing or invalid. Effect packs can call this to match server behavior.
+        /// </summary>
+        [HookMethod("CC_ParseEffectDurationSeconds")]
+        public object CC_ParseEffectDurationSeconds(JObject effect)
+        {
+            if (effect == null)
+            {
+                return 0;
+            }
+
+            return TryReadEffectDurationSeconds(effect);
         }
 
         private bool RegisterEffectsInternal(string providerName, object effectsPayload, bool localOnly)
@@ -2421,7 +2443,6 @@ namespace Oxide.Plugins
             var trimmed = json.Trim();
             if (!trimmed.StartsWith("{") && !trimmed.StartsWith("["))
             {
-                //LogVerbose($"Ignoring non-JSON socket frame: {trimmed}");
                 return;
             }
 
@@ -2959,7 +2980,6 @@ namespace Oxide.Plugins
             {
                 if (IsInstanceOwnershipError(ex.Message) || IsHttpUnauthorized(ex.Message))
                 {
-                    //LogVerbose("Session start instance ownership mismatch detected; refreshing application instance ID and retrying once.");
                     _data.ApplicationInstanceId = string.Empty;
                     _data.ApplicationInstanceAppId = string.Empty;
                     SaveData();
@@ -3579,7 +3599,6 @@ namespace Oxide.Plugins
                 ?? string.Empty;
             if (!IsSupportedEffectType(effectType, effectId))
             {
-                //LogVerbose($"Ignoring unsupported effect requestID={requestId}, effectID={effectId}, effectType={effectType}.");
                 ClearEffectRetryState(requestId);
                 return;
             }
@@ -4198,7 +4217,7 @@ namespace Oxide.Plugins
                 return false;
             }
 
-            if (providerResult is System.Collections.IDictionary && !(providerResult is JObject))
+            if (providerResult is System.Collections.IDictionary)
             {
                 try
                 {

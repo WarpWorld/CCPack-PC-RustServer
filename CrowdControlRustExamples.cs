@@ -4,14 +4,23 @@ using Oxide.Core.Plugins;
 
 namespace Oxide.Plugins
 {
-    [Info("CrowdControlRustExamples", "Warp World", "1.0.0")]
+    /// <summary>
+    /// Minimal sample plugin: instant success, timed effect, and async completion patterns for <c>CC_RegisterEffects</c>.
+    /// </summary>
+    [Info("CrowdControlRustExamples", "Warp World", "1.0.1")]
     [Description("Example external Crowd Control provider with 3 effect patterns.")]
     public class CrowdControlRustExamples : RustPlugin
     {
+        #region Fields
+
         [PluginReference]
         private Plugin CrowdControl;
 
         private const string ProviderName = "CrowdControlRustExamples";
+
+        #endregion
+
+        #region Oxide lifecycle
 
         private void OnServerInitialized()
         {
@@ -35,6 +44,10 @@ namespace Oxide.Plugins
                 RegisterExampleEffects();
             }
         }
+
+        #endregion
+
+        #region Registration and hook
 
         private void RegisterExampleEffects()
         {
@@ -141,5 +154,7 @@ namespace Oxide.Plugins
                 ["reason"] = $"Unknown external example effect '{effectId}'."
             };
         }
+
+        #endregion
     }
 }
