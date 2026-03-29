@@ -15,7 +15,7 @@ namespace Oxide.Plugins
     /// Built-in rows are defined as <c>BuiltInEffectMeta</c> entries in <c>BuiltInEffectCatalog</c> (Built-in effect catalog region): effect id, display name,
     /// description, default price, optional menu duration string, and optional timed Pub/Sub fallback seconds. <c>player_fire</c> uses a separate burn timed lifecycle.
     /// </remarks>
-    [Info("CrowdControlEffects", "Warp World", "1.0.2")]
+    [Info("CrowdControlEffects", "Warp World", "1.0.3")]
     [Description("Built-in Crowd Control Rust effect provider.")]
     public class CrowdControlEffects : RustPlugin
     {
@@ -1715,8 +1715,22 @@ namespace Oxide.Plugins
             }
 
             sky.Cycle.Hour = setDay ? 13f : 23f;
-            ShowEffectUi(player, "Crowd Control", setDay ? "Time changed: Day" : "Time changed: Night");
+            BroadcastDayNightCrowdControlToast(player?.displayName, setDay);
             return true;
+        }
+
+        private void BroadcastDayNightCrowdControlToast(string streamerDisplayName, bool isDay)
+        {
+            var name = string.IsNullOrWhiteSpace(streamerDisplayName) ? "A streamer" : streamerDisplayName.Trim();
+            var phase = isDay ? "day" : "night";
+            var message = $"{name}'s chat made it {phase}";
+            foreach (var p in BasePlayer.activePlayerList)
+            {
+                if (p != null && p.IsConnected)
+                {
+                    SendToast(p, 0, message);
+                }
+            }
         }
 
         private bool TryTakeItem(BasePlayer player, string shortName, int amount, out string error)
