@@ -132,6 +132,8 @@ Main fields:
   "session_rules": {
     "enable_integration_triggers": true,
     "enable_price_change": true,
+    "enforce_pricing": false,
+    "variable_pricing": false,
     "disable_test_effects": false,
     "disable_custom_effects_sync": false
   },
@@ -167,6 +169,10 @@ Main fields:
   - Allows or blocks integration-triggered effects.
 - `enable_price_change`
   - Allows or blocks price-change style effects.
+- `enforce_pricing`
+  - When true, session start includes server-enforced pricing in `sessionRules` so Crowd Control can lock pricing to server policy for that session.
+- `variable_pricing`
+  - When true (often together with `enforce_pricing`), session start tells the backend it may apply a variable price multiplier based on criteria evaluated at session start.
 - `disable_test_effects`
   - Rejects test effects locally and shows a toast to the player when one is received but blocked.
 - `disable_custom_effects_sync`

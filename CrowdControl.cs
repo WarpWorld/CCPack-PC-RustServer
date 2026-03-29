@@ -17,7 +17,7 @@ namespace Oxide.Plugins
     /// <summary>
     /// Crowd Control integration for Rust: player linking, Pub/Sub WebSocket RPC, game sessions, retries, and a small public hook API (<c>CC_*</c>) for effect packs.
     /// </summary>
-    [Info("CrowdControl", "Warp World", "1.0.5")]
+    [Info("CrowdControl", "Warp World", "1.0.7")]
     [Description("Crowd Control integration for Rust with auth, PubSub, and permission-based access controls.")]
     public class CrowdControl : RustPlugin
     {
@@ -26,6 +26,10 @@ namespace Oxide.Plugins
         private const string PermUse = "crowdcontrol.use";
         private const string PermAdmin = "crowdcontrol.admin";
         private const string PermIgnore = "crowdcontrol.ignore";
+        /// <summary>
+        /// Players with this permission are skipped when <c>broadcast_effects_to_all_players</c> fans out an effect to the server.
+        /// </summary>
+        private const string PermBroadcastExclude = "crowdcontrol.broadcast.exclude";
         private const bool StopSessionOnDisconnect = true;
         private const int SocketKeepAliveMinutes = 5;
         private const bool StopSessionOnUnload = true;
@@ -35,7 +39,7 @@ namespace Oxide.Plugins
         private const string GamePackId = "RustServer";
         private const string PubSubWebSocketUrl = "wss://pubsub.crowdcontrol.live";
         private const string OpenApiUrl = "https://openapi.crowdcontrol.live";
-        private const string UserAgent = "CrowdControl/1.0.5";
+        private const string UserAgent = "CrowdControl/1.0.7";
         private const bool VerboseLogging = true;
         private const int CustomEffectsPerOperation = 20;
         private const string DefaultEffectsFileName = "CrowdControl-DefaultEffects.json";
@@ -134,6 +138,25 @@ namespace Oxide.Plugins
 
             [JsonProperty("disable_custom_effects_sync")]
             public bool DisableCustomEffectsSync { get; set; } = false;
+
+            /// <summary>
+            /// When true, session start tells Crowd Control to use server-enforced pricing for this session.
+            /// </summary>
+            [JsonProperty("enforce_pricing")]
+            public bool EnforcePricing { get; set; } = false;
+
+            /// <summary>
+            /// When true (typically with <see cref="EnforcePricing"/>), the backend may apply a variable price multiplier from session context.
+            /// </summary>
+            [JsonProperty("variable_pricing")]
+            public bool VariablePricing { get; set; } = false;
+
+            /// <summary>
+            /// When true, after the primary target's effect is accepted by Crowd Control (immediate success, timed begin, or async success),
+            /// the same effect is invoked locally for every other connected player except those with <c>crowdcontrol.broadcast.exclude</c>.
+            /// </summary>
+            [JsonProperty("broadcast_effects_to_all_players")]
+            public bool BroadcastEffectsToAllPlayers { get; set; } = false;
         }
 
         private sealed class RetryPolicyConfig
@@ -240,6 +263,10 @@ namespace Oxide.Plugins
             public JObject MenuEffect;
             public bool LocalOnly;
             public JObject DefaultMenuEffect;
+            /// <summary>
+            /// When true, <see cref="SessionRulesConfig.BroadcastEffectsToAllPlayers"/> does not fan this effect out (server/world scope — already applied once).
+            /// </summary>
+            public bool WorldEffect;
         }
 
         private sealed class ExternalEffectPendingRequest
@@ -250,6 +277,11 @@ namespace Oxide.Plugins
             public string SteamId;
             public string Token;
             public Oxide.Plugins.Timer TimeoutTimer;
+            /// <summary>
+            /// Set for async <c>pending</c> completions when broadcast was enabled at dispatch time (not used for <c>timedBegin</c>, which fans out immediately).
+            /// </summary>
+            public JObject BroadcastPayloadClone;
+            public JObject BroadcastEffectClone;
         }
 
         private enum CommandReplyMode
@@ -367,6 +399,7 @@ namespace Oxide.Plugins
             permission.RegisterPermission(PermUse, this);
             permission.RegisterPermission(PermAdmin, this);
             permission.RegisterPermission(PermIgnore, this);
+            permission.RegisterPermission(PermBroadcastExclude, this);
             _data = Interface.Oxide.DataFileSystem.ReadObject<StoredData>(Name) ?? new StoredData();
             Puts("CrowdControl initialized.");
         }
@@ -820,7 +853,7 @@ namespace Oxide.Plugins
                 "Active server settings:",
                 $"Access: {(_config?.AllowAllUsersWithoutPermission ?? true ? "all players may use Crowd Control" : $"permission required ({PermUse})")}",
                 $"Auth bypass permission: {PermIgnore}",
-                $"Session rules: integration triggers={(rules.EnableIntegrationTriggers ? "enabled" : "disabled")}, price changes={(rules.EnablePriceChange ? "enabled" : "disabled")}, test effects={(rules.DisableTestEffects ? "disabled" : "enabled")}, custom effect sync={(rules.DisableCustomEffectsSync ? "disabled" : "enabled")}",
+                $"Session rules: integration triggers={(rules.EnableIntegrationTriggers ? "enabled" : "disabled")}, price changes={(rules.EnablePriceChange ? "enabled" : "disabled")}, enforce pricing={(rules.EnforcePricing ? "enabled" : "disabled")}, variable pricing={(rules.VariablePricing ? "enabled" : "disabled")}, test effects={(rules.DisableTestEffects ? "disabled" : "enabled")}, custom effect sync={(rules.DisableCustomEffectsSync ? "disabled" : "enabled")}",
                 $"Enforcement: {(enforce.Enabled ? "enabled" : "disabled")}, grace={Math.Max(30, enforce.EnforceTimeSeconds)}s, restrict movement={(enforce.RestrictMovement ? "enabled" : "disabled")}",
                 $"Retry policy: {(retry.Enabled ? "enabled" : "disabled")}",
                 $"Retry default: attempts={retryDefault.MaxAttempts}, duration={retryDefault.MaxDurationSeconds}s, interval={retryDefault.RetryIntervalSeconds:0.##}s",
@@ -1012,13 +1045,20 @@ namespace Oxide.Plugins
                     configuredById.TryGetValue(effectId, out var configuredEntry);
                     var menuObj = BuildConfiguredEffectMenu(item, configuredEntry ?? defaultEntry, localOnly);
 
+                    var worldEffect = item.Value<bool?>("worldEffect") ??
+                        item.Value<bool?>("world_effect") ??
+                        item.Value<bool?>("skipBroadcastFanout") ??
+                        item.Value<bool?>("skip_broadcast_fanout") ??
+                        false;
+
                     _externalEffectsById[effectId] = new ExternalEffectDefinition
                     {
                         ProviderName = normalizedProvider,
                         EffectId = effectId,
                         MenuEffect = menuObj,
                         LocalOnly = localOnly,
-                        DefaultMenuEffect = (JObject)item.DeepClone()
+                        DefaultMenuEffect = (JObject)item.DeepClone(),
+                        WorldEffect = worldEffect
                     };
                     providerEffectIds.Add(effectId);
                     registered++;
@@ -1502,6 +1542,16 @@ namespace Oxide.Plugins
                     SendEffectResponseAsync(pending.Token, pending.RequestId, normalizedStatus, reason ?? string.Empty),
                     $"external completion {normalizedStatus}"
                 );
+                if (isFinal && string.Equals(normalizedStatus, "success", StringComparison.OrdinalIgnoreCase) &&
+                    pending.BroadcastPayloadClone != null && pending.BroadcastEffectClone != null)
+                {
+                    ScheduleEffectBroadcastFanout(
+                        pending.SteamId,
+                        requestId,
+                        pending.EffectId,
+                        pending.BroadcastPayloadClone,
+                        pending.BroadcastEffectClone);
+                }
             }
 
             LogVerbose($"External effect response requestID={requestId}, provider={pending.ProviderName}, status={normalizedStatus}.");
@@ -2896,6 +2946,23 @@ namespace Oxide.Plugins
             }
         }
 
+        /// <summary>
+        /// Builds the <c>sessionRules</c> object sent to <c>POST /game-session/start</c> (camelCase keys per OpenAPI).
+        /// </summary>
+        private JObject BuildGameSessionStartSessionRulesPayload()
+        {
+            var rules = _config?.SessionRules ?? new SessionRulesConfig();
+            return new JObject
+            {
+                ["enableIntegrationTriggers"] = rules.EnableIntegrationTriggers,
+                ["enablePriceChange"] = rules.EnablePriceChange,
+                ["disableTestEffects"] = rules.DisableTestEffects,
+                ["disableCustomEffectsSync"] = rules.DisableCustomEffectsSync,
+                ["enforcePricing"] = rules.EnforcePricing,
+                ["variablePricing"] = rules.VariablePricing
+            };
+        }
+
         private async Task StartGameSessionAsync(PlayerSessionState session, string notifySteamId = null)
         {
             if (!IsSessionTokenUsable(session))
@@ -2931,13 +2998,7 @@ namespace Oxide.Plugins
                 {
                     ["gamePackID"] = GamePackId,
                     ["effectReportArgs"] = new JArray(),
-                    ["sessionRules"] = new JObject
-                    {
-                        ["enableIntegrationTriggers"] = _config?.SessionRules?.EnableIntegrationTriggers ?? true,
-                        ["enablePriceChange"] = _config?.SessionRules?.EnablePriceChange ?? true,
-                        ["disableTestEffects"] = _config?.SessionRules?.DisableTestEffects ?? false,
-                        ["disableCustomEffectsSync"] = _config?.SessionRules?.DisableCustomEffectsSync ?? false
-                    }
+                    ["sessionRules"] = BuildGameSessionStartSessionRulesPayload()
                 };
                 if (!string.IsNullOrEmpty(_config?.AppId))
                 {
@@ -2992,13 +3053,7 @@ namespace Oxide.Plugins
                         {
                             ["gamePackID"] = GamePackId,
                             ["effectReportArgs"] = new JArray(),
-                            ["sessionRules"] = new JObject
-                            {
-                                ["enableIntegrationTriggers"] = _config?.SessionRules?.EnableIntegrationTriggers ?? true,
-                                ["enablePriceChange"] = _config?.SessionRules?.EnablePriceChange ?? true,
-                                ["disableTestEffects"] = _config?.SessionRules?.DisableTestEffects ?? false,
-                                ["disableCustomEffectsSync"] = _config?.SessionRules?.DisableCustomEffectsSync ?? false
-                            }
+                            ["sessionRules"] = BuildGameSessionStartSessionRulesPayload()
                         };
 
                         if (!string.IsNullOrEmpty(_config?.AppId))
@@ -3708,6 +3763,7 @@ namespace Oxide.Plugins
                             SendTimedResponseAsync(responseToken, requestId, "timedBegin", externalTimeRemainingMs, externalReason ?? string.Empty),
                             "external effect timedBegin"
                         );
+                        ScheduleEffectBroadcastFanout(steamId, requestId, effectId, payload, effect);
                     }
                     return;
                 }
@@ -3717,6 +3773,10 @@ namespace Oxide.Plugins
                     SendEffectResponseAsync(responseToken, requestId, externalStatus, externalReason ?? string.Empty),
                     $"external effect {externalStatus}"
                 );
+                if (string.Equals(externalStatus, "success", StringComparison.OrdinalIgnoreCase))
+                {
+                    ScheduleEffectBroadcastFanout(steamId, requestId, effectId, payload, effect);
+                }
                 return;
             }
 
@@ -4006,6 +4066,102 @@ namespace Oxide.Plugins
             }
         }
 
+        private bool ShouldBroadcastEffectsToAllPlayers()
+        {
+            return _config?.SessionRules?.BroadcastEffectsToAllPlayers ?? false;
+        }
+
+        private bool ShouldSkipBroadcastFanoutForEffect(string effectId)
+        {
+            if (string.IsNullOrWhiteSpace(effectId))
+            {
+                return false;
+            }
+
+            var normalized = NormalizeEffectId(effectId);
+            lock (_externalEffectsSync)
+            {
+                return _externalEffectsById.TryGetValue(normalized, out var def) && def.WorldEffect;
+            }
+        }
+
+        /// <summary>
+        /// After the primary target's effect is accepted by Crowd Control, runs the same provider hook for other connected players.
+        /// Does not send additional Crowd Control responses; uses synthetic request IDs and sets <c>crowdControlFanout</c> on the context.
+        /// </summary>
+        private void ScheduleEffectBroadcastFanout(string primarySteamId, string originalRequestId, string effectId, JObject payload, JObject effect)
+        {
+            if (!ShouldBroadcastEffectsToAllPlayers() || string.IsNullOrWhiteSpace(primarySteamId) ||
+                string.IsNullOrWhiteSpace(originalRequestId) || string.IsNullOrWhiteSpace(effectId))
+            {
+                return;
+            }
+
+            if (ShouldSkipBroadcastFanoutForEffect(effectId))
+            {
+                LogVerbose($"Broadcast fan-out skipped for server-wide effect effectID={effectId}.");
+                return;
+            }
+
+            var payloadClone = payload != null ? (JObject)payload.DeepClone() : new JObject();
+            var effectClone = effect != null ? (JObject)effect.DeepClone() : new JObject();
+            timer.Once(
+                0f,
+                () =>
+                {
+                    if (_isUnloading)
+                    {
+                        return;
+                    }
+
+                    FanOutCrowdControlEffect(primarySteamId, originalRequestId, effectId, payloadClone, effectClone);
+                });
+        }
+
+        private void FanOutCrowdControlEffect(string primarySteamId, string originalRequestId, string effectId, JObject payload, JObject effect)
+        {
+            if (!ShouldBroadcastEffectsToAllPlayers())
+            {
+                return;
+            }
+
+            foreach (var other in BasePlayer.activePlayerList)
+            {
+                if (other == null || !other.IsConnected)
+                {
+                    continue;
+                }
+
+                var otherId = other.UserIDString;
+                if (string.IsNullOrEmpty(otherId) ||
+                    string.Equals(otherId, primarySteamId, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (permission.UserHasPermission(otherId, PermBroadcastExclude))
+                {
+                    continue;
+                }
+
+                var syntheticRequestId = $"{originalRequestId}__ccFanout__{otherId}";
+                TryDispatchExternalEffect(
+                    syntheticRequestId,
+                    effectId,
+                    string.Empty,
+                    other,
+                    payload,
+                    effect,
+                    out _,
+                    out _,
+                    out _,
+                    out _,
+                    out _,
+                    suppressPendingRegistration: true,
+                    crowdControlFanoutOriginalRequestId: originalRequestId);
+            }
+        }
+
         private bool TryDispatchExternalEffect(
             string requestId,
             string effectId,
@@ -4017,7 +4173,9 @@ namespace Oxide.Plugins
             out string reason,
             out string playerMessage,
             out bool pending,
-            out long? timeRemainingMs)
+            out long? timeRemainingMs,
+            bool suppressPendingRegistration = false,
+            string crowdControlFanoutOriginalRequestId = null)
         {
             status = string.Empty;
             reason = string.Empty;
@@ -4060,6 +4218,14 @@ namespace Oxide.Plugins
                 ["effect"] = effectPayload != null ? (JObject)effectPayload.DeepClone() : new JObject(),
                 ["payload"] = payload != null ? (JObject)payload.DeepClone() : new JObject()
             };
+            if (suppressPendingRegistration)
+            {
+                context["crowdControlFanout"] = true;
+                if (!string.IsNullOrEmpty(crowdControlFanoutOriginalRequestId))
+                {
+                    context["originalRequestID"] = crowdControlFanoutOriginalRequestId;
+                }
+            }
 
             object providerResult;
             try
@@ -4102,6 +4268,15 @@ namespace Oxide.Plugins
                 return true;
             }
 
+            if (suppressPendingRegistration)
+            {
+                LogVerbose(
+                    $"External effect fanout returned pending/timed state requestID={requestId}, effectID={effectId}, provider={definition.ProviderName}, status={status}; not registering with Crowd Control."
+                );
+                pending = false;
+                return true;
+            }
+
             var pendingState = new ExternalEffectPendingRequest
             {
                 RequestId = requestId,
@@ -4110,6 +4285,13 @@ namespace Oxide.Plugins
                 SteamId = player?.UserIDString ?? string.Empty,
                 Token = responseToken
             };
+            if (ShouldBroadcastEffectsToAllPlayers() &&
+                !string.Equals(status, "timedBegin", StringComparison.OrdinalIgnoreCase))
+            {
+                pendingState.BroadcastPayloadClone = payload != null ? (JObject)payload.DeepClone() : new JObject();
+                pendingState.BroadcastEffectClone = effectPayload != null ? (JObject)effectPayload.DeepClone() : new JObject();
+            }
+
             pendingState.TimeoutTimer = timer.Once(
                 GetExternalEffectTimeoutSeconds(status, timeRemainingMs),
                 () => HandleExternalEffectTimeout(requestId));
@@ -5287,7 +5469,10 @@ namespace Oxide.Plugins
                 rules.EnableIntegrationTriggers ? "1" : "0",
                 rules.EnablePriceChange ? "1" : "0",
                 rules.DisableTestEffects ? "1" : "0",
-                rules.DisableCustomEffectsSync ? "1" : "0");
+                rules.DisableCustomEffectsSync ? "1" : "0",
+                rules.EnforcePricing ? "1" : "0",
+                rules.VariablePricing ? "1" : "0",
+                rules.BroadcastEffectsToAllPlayers ? "1" : "0");
         }
 
         private bool IsEffectBlockedBySessionRules(JObject payload, JObject effect, PlayerSessionState session, out string reason)
