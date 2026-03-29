@@ -14,7 +14,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("CrowdControl", "Warp World", "1.0.3")]
+    [Info("CrowdControl", "Warp World", "1.0.4")]
     [Description("Crowd Control integration for Rust with auth, PubSub, and permission-based access controls.")]
     public class CrowdControl : RustPlugin
     {
@@ -30,12 +30,20 @@ namespace Oxide.Plugins
         private const string GamePackId = "RustServer";
         private const string PubSubWebSocketUrl = "wss://pubsub.crowdcontrol.live";
         private const string OpenApiUrl = "https://openapi.crowdcontrol.live";
-        private const string UserAgent = "CrowdControl/1.0.3";
+        private const string UserAgent = "CrowdControl/1.0.5";
         private const bool VerboseLogging = true;
         private const int CustomEffectsPerOperation = 20;
         private const string DefaultEffectsFileName = "CrowdControl-DefaultEffects.json";
         private const string CustomEffectsFilePrefix = "CrowdControl-CustomEffects-";
         private const float ExternalEffectPendingTimeoutSeconds = 15f;
+        /// <summary>
+        /// When a player joins the server, reject stored Crowd Control tokens that expire sooner than this (PubSub stops delivering once the JWT expires).
+        /// </summary>
+        private const long TokenMinRemainingLifetimeSeconds = 3L * 60 * 60;
+        /// <summary>
+        /// End Crowd Control auth and game session this many seconds before the JWT expires so players can re-link before events stop.
+        /// </summary>
+        private const long TokenProactiveLogoutLeadSeconds = 10L * 60;
         private const string ExternalEffectHookName = "OnCrowdControlEffect";
         private const string BuiltInEffectsPluginName = "CrowdControlEffects";
         private static readonly List<string> Scopes = new List<string>
@@ -74,6 +82,8 @@ namespace Oxide.Plugins
         private CancellationTokenSource _socketCts;
         private Oxide.Plugins.Timer _reconnectTimer;
         private Oxide.Plugins.Timer _heartbeatTimer;
+        private readonly Dictionary<string, Oxide.Plugins.Timer> _tokenExpiryLogoutTimers =
+            new Dictionary<string, Oxide.Plugins.Timer>(StringComparer.OrdinalIgnoreCase);
         private bool _isSocketConnecting;
         private volatile bool _isUnloading;
         private DateTime _lastSocketConnectUtc = DateTime.MinValue;
@@ -405,6 +415,12 @@ namespace Oxide.Plugins
             _heartbeatTimer?.Destroy();
             _heartbeatTimer = null;
 
+            foreach (var kvp in _tokenExpiryLogoutTimers)
+            {
+                kvp.Value?.Destroy();
+            }
+            _tokenExpiryLogoutTimers.Clear();
+
             _socketCts?.Cancel();
             _socket?.Abort();
             _socket?.Dispose();
@@ -446,14 +462,19 @@ namespace Oxide.Plugins
             }
 
             PruneStoredSessionIfInvalid(player.UserIDString, CommandReplyMode.Console, notifyPlayer: false);
+            PruneStoredSessionIfTokenTooShortLivedAtJoin(player.UserIDString, CommandReplyMode.Console);
             MaybeShowCrowdControlJoinInstructions(player);
             RefreshCrowdControlEnforcement(player);
 
             FireAndForget(EnsureSocketConnectedAsync(), "socket state check on connect");
-            if (TryGetAuthenticatedSession(player.UserIDString, out var session, pruneInvalid: false) &&
-                string.IsNullOrEmpty(session.GameSessionId))
+            if (TryGetAuthenticatedSession(player.UserIDString, out var connectedSession, pruneInvalid: false))
             {
-                FireAndForget(RestartGameSessionAsync(session, player.UserIDString), "start session on connect");
+                if (string.IsNullOrEmpty(connectedSession.GameSessionId))
+                {
+                    FireAndForget(RestartGameSessionAsync(connectedSession, player.UserIDString), "start session on connect");
+                }
+
+                ScheduleTokenExpiryLogoutForPlayer(player.UserIDString);
             }
 
             NotifyCrowdControlProvidersSessionStateChanged();
@@ -1895,6 +1916,8 @@ namespace Oxide.Plugins
                 return false;
             }
 
+            CancelTokenExpiryLogoutTimer(steamId);
+
             PlayerSessionState session = null;
             var hadSession = _data?.PlayerSessions != null &&
                 _data.PlayerSessions.TryGetValue(steamId, out session) &&
@@ -2780,7 +2803,7 @@ namespace Oxide.Plugins
                 LogVerbose(
                     $"Auth token decoded ccUID={decoded.CcUid}, profileType={decoded.ProfileType}, tokenScopes={decoded.ScopeSummary ?? "(missing)"}");
 
-                _data.PlayerSessions[steamId] = new PlayerSessionState
+                var newSession = new PlayerSessionState
                 {
                     SteamId = steamId,
                     Token = token,
@@ -2791,6 +2814,22 @@ namespace Oxide.Plugins
                     TokenExpiryUnix = decoded.Exp,
                     AuthenticatedAtUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
                 };
+
+                if (!HasMinimumTokenRemainingLifetime(newSession))
+                {
+                    var shortLifePlayer = FindPlayerBySteamId(steamId);
+                    if (shortLifePlayer != null)
+                    {
+                        SendCommandReply(shortLifePlayer, replyMode,
+                            "Crowd Control login expires in under 3 hours. Sign in again from the Crowd Control app for a longer session, then run link.");
+                        SendCommandReply(shortLifePlayer, CommandReplyMode.Chat,
+                            "Crowd Control login is too short-lived (under 3 hours). Re-auth in the app and run /cc link.");
+                    }
+
+                    return;
+                }
+
+                _data.PlayerSessions[steamId] = newSession;
                 SaveData();
 
                 if (string.IsNullOrEmpty(_data.ApplicationInstanceId))
@@ -2818,6 +2857,7 @@ namespace Oxide.Plugins
                 }
 
                 NotifyCrowdControlProvidersSessionStateChanged();
+                ScheduleTokenExpiryLogoutForPlayer(steamId);
             }
             catch (Exception ex)
             {
@@ -3550,7 +3590,7 @@ namespace Oxide.Plugins
                 return;
             }
 
-            var durationSeconds = effect.Value<int?>("duration") ?? 0;
+            var durationSeconds = TryReadEffectDurationSeconds(effect);
             LogVerbose($"Effect request received requestID={requestId}, effectID={effectId}, duration={durationSeconds}s.");
 
             var targetCcUid = GetTargetCrowdControlUid(payload);
@@ -4016,6 +4056,27 @@ namespace Oxide.Plugins
 
             ParseExternalProviderResult(providerResult, out status, out reason, out playerMessage, out pending, out timeRemainingMs);
 
+            if (string.Equals(status, "timedBegin", StringComparison.OrdinalIgnoreCase))
+            {
+                pending = true;
+                if (!timeRemainingMs.HasValue)
+                {
+                    var inferredSec = TryReadEffectDurationSeconds(effectPayload);
+                    if (inferredSec > 0)
+                    {
+                        timeRemainingMs = inferredSec * 1000L;
+                    }
+                }
+
+                if (!timeRemainingMs.HasValue)
+                {
+                    timeRemainingMs = 15_000L;
+                    LogVerbose(
+                        $"External timedBegin without timeRemainingMs requestID={requestId}, effectID={effectId}; using 15s for API timeout."
+                    );
+                }
+            }
+
             if (!pending)
             {
                 status = NormalizeExternalCompletionStatus(status);
@@ -4067,6 +4128,22 @@ namespace Oxide.Plugins
                 return;
             }
 
+            if (TryCoerceProviderHookResultToJObject(providerResult, out var resultObject))
+            {
+                status = resultObject.Value<string>("status") ?? "success";
+                reason = resultObject.Value<string>("reason") ?? string.Empty;
+                playerMessage = resultObject.Value<string>("playerMessage")
+                    ?? resultObject.Value<string>("message")
+                    ?? string.Empty;
+                pending = string.Equals(status, "pending", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(status, "timedBegin", StringComparison.OrdinalIgnoreCase) ||
+                    resultObject.Value<bool?>("pending") == true;
+                timeRemainingMs = ReadOptionalMillisecondsFromToken(resultObject["timeRemainingMs"])
+                    ?? ReadOptionalMillisecondsFromToken(resultObject["timeRemaining"])
+                    ?? ReadOptionalMillisecondsFromToken(resultObject["durationMs"]);
+                return;
+            }
+
             if (providerResult is string statusText)
             {
                 var normalized = (statusText ?? string.Empty).Trim();
@@ -4086,22 +4163,166 @@ namespace Oxide.Plugins
                 status = normalized;
                 return;
             }
+        }
 
-            if (providerResult is JObject obj)
+        private static bool TryCoerceProviderHookResultToJObject(object providerResult, out JObject obj)
+        {
+            obj = null;
+            if (providerResult == null)
             {
-                status = obj.Value<string>("status") ?? "success";
-                reason = obj.Value<string>("reason") ?? string.Empty;
-                playerMessage = obj.Value<string>("playerMessage")
-                    ?? obj.Value<string>("message")
-                    ?? string.Empty;
-                pending = string.Equals(status, "pending", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(status, "timedBegin", StringComparison.OrdinalIgnoreCase) ||
-                    obj.Value<bool?>("pending") == true;
-                timeRemainingMs = obj.Value<long?>("timeRemainingMs")
-                    ?? obj.Value<long?>("timeRemaining")
-                    ?? obj.Value<long?>("durationMs");
-                return;
+                return false;
             }
+
+            if (providerResult is JObject jObject)
+            {
+                obj = jObject;
+                return true;
+            }
+
+            if (providerResult is string s)
+            {
+                s = s.Trim();
+                if (s.Length > 0 && s[0] == '{')
+                {
+                    try
+                    {
+                        obj = JObject.Parse(s);
+                        return true;
+                    }
+                    catch
+                    {
+                        return false;
+                    }
+                }
+
+                return false;
+            }
+
+            if (providerResult is System.Collections.IDictionary && !(providerResult is JObject))
+            {
+                try
+                {
+                    obj = JObject.FromObject(providerResult);
+                    return obj != null;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            try
+            {
+                var token = JToken.FromObject(providerResult);
+                obj = token as JObject ?? (token?.Type == JTokenType.Object ? (JObject)token : null);
+                return obj != null;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static long? ReadOptionalMillisecondsFromToken(JToken token)
+        {
+            if (token == null || token.Type == JTokenType.Null)
+            {
+                return null;
+            }
+
+            try
+            {
+                if (token.Type == JTokenType.String && long.TryParse(token.Value<string>(), out var parsedLong))
+                {
+                    return parsedLong >= 0 ? parsedLong : (long?)null;
+                }
+
+                var d = token.ToObject<double>();
+                if (double.IsNaN(d) || double.IsInfinity(d) || d < 0d)
+                {
+                    return null;
+                }
+
+                return (long)Math.Round(d);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static int TryReadEffectDurationSeconds(JObject effect)
+        {
+            if (effect == null)
+            {
+                return 0;
+            }
+
+            var d = effect["duration"];
+            if (d == null || d.Type == JTokenType.Null)
+            {
+                return 0;
+            }
+
+            if (d.Type == JTokenType.Integer || d.Type == JTokenType.Float)
+            {
+                try
+                {
+                    var n = d.ToObject<double>();
+                    return n > 0d ? Mathf.Max(1, Mathf.RoundToInt((float)n)) : 0;
+                }
+                catch
+                {
+                    return 0;
+                }
+            }
+
+            if (d.Type == JTokenType.String)
+            {
+                if (double.TryParse(d.Value<string>(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var parsed) && parsed > 0d)
+                {
+                    return Mathf.Max(1, Mathf.RoundToInt((float)parsed));
+                }
+
+                return 0;
+            }
+
+            if (d is JObject durationObj)
+            {
+                var sec = durationObj.Value<int?>("seconds");
+                if (sec.HasValue && sec.Value > 0)
+                {
+                    return sec.Value;
+                }
+
+                var valueToken = durationObj["value"];
+                if (valueToken != null && valueToken.Type != JTokenType.Null)
+                {
+                    if (valueToken.Type == JTokenType.Integer || valueToken.Type == JTokenType.Float)
+                    {
+                        try
+                        {
+                            var n = valueToken.ToObject<double>();
+                            if (n > 0d)
+                            {
+                                return Mathf.Max(1, Mathf.RoundToInt((float)n));
+                            }
+                        }
+                        catch
+                        {
+                            // fall through
+                        }
+                    }
+
+                    var durationValue = valueToken.Type == JTokenType.String ? valueToken.Value<string>() : valueToken.ToString();
+                    if (!string.IsNullOrWhiteSpace(durationValue) && TimeSpan.TryParse(durationValue, out var parsedDuration))
+                    {
+                        return Mathf.Max(1, Mathf.RoundToInt((float)parsedDuration.TotalSeconds));
+                    }
+                }
+            }
+
+            return 0;
         }
 
         private void HandleExternalEffectTimeout(string requestId)
@@ -4437,6 +4658,136 @@ namespace Oxide.Plugins
         {
             return TryGetSessionTokenExpiryUnix(session, out var expiryUnix) &&
                 expiryUnix > DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        }
+
+        private bool TryGetSessionTokenSecondsRemaining(PlayerSessionState session, out long remainingSeconds)
+        {
+            remainingSeconds = 0;
+            if (!TryGetSessionTokenExpiryUnix(session, out var expiryUnix))
+            {
+                return false;
+            }
+
+            remainingSeconds = expiryUnix - DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            return true;
+        }
+
+        private bool HasMinimumTokenRemainingLifetime(PlayerSessionState session)
+        {
+            return TryGetSessionTokenSecondsRemaining(session, out var remaining) &&
+                remaining >= TokenMinRemainingLifetimeSeconds;
+        }
+
+        private void CancelTokenExpiryLogoutTimer(string steamId)
+        {
+            if (string.IsNullOrWhiteSpace(steamId))
+            {
+                return;
+            }
+
+            if (!_tokenExpiryLogoutTimers.TryGetValue(steamId, out var t))
+            {
+                return;
+            }
+
+            t?.Destroy();
+            _tokenExpiryLogoutTimers.Remove(steamId);
+        }
+
+        private void ScheduleTokenExpiryLogoutForPlayer(string steamId)
+        {
+            if (string.IsNullOrWhiteSpace(steamId) || _isUnloading)
+            {
+                return;
+            }
+
+            CancelTokenExpiryLogoutTimer(steamId);
+
+            if (!_data.PlayerSessions.TryGetValue(steamId, out var session) ||
+                !TryGetSessionTokenExpiryUnix(session, out var expUnix))
+            {
+                return;
+            }
+
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var delaySeconds = (double)(expUnix - TokenProactiveLogoutLeadSeconds - now);
+            if (delaySeconds <= 0d)
+            {
+                ProactiveTokenExpiryLogout(steamId);
+                return;
+            }
+
+            _tokenExpiryLogoutTimers[steamId] = timer.Once((float)delaySeconds, () =>
+            {
+                _tokenExpiryLogoutTimers.Remove(steamId);
+                ProactiveTokenExpiryLogout(steamId);
+            });
+        }
+
+        private void ProactiveTokenExpiryLogout(string steamId)
+        {
+            if (_isUnloading || string.IsNullOrWhiteSpace(steamId))
+            {
+                return;
+            }
+
+            if (!_data.PlayerSessions.TryGetValue(steamId, out var session) ||
+                !TryGetSessionTokenExpiryUnix(session, out var expUnix))
+            {
+                return;
+            }
+
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            if (now < expUnix - TokenProactiveLogoutLeadSeconds)
+            {
+                ScheduleTokenExpiryLogoutForPlayer(steamId);
+                return;
+            }
+
+            var player = FindPlayerBySteamId(steamId);
+            if (player != null && player.IsConnected)
+            {
+                SendCommandReply(player, CommandReplyMode.Console,
+                    "Crowd Control session ended because your login is about to expire. Run cc link to sign in again.");
+                SendCommandReply(player, CommandReplyMode.Chat,
+                    "Crowd Control session ended (login expiring). Run /cc link to sign in again.");
+            }
+
+            ClearPlayerAuthState(steamId, stopActiveSession: true);
+        }
+
+        private void PruneStoredSessionIfTokenTooShortLivedAtJoin(string steamId, CommandReplyMode replyMode)
+        {
+            if (string.IsNullOrWhiteSpace(steamId))
+            {
+                return;
+            }
+
+            var status = GetStoredSessionStatus(steamId, out var session);
+            if (status != StoredSessionStatus.Valid || session == null)
+            {
+                return;
+            }
+
+            if (HasMinimumTokenRemainingLifetime(session))
+            {
+                return;
+            }
+
+            ClearPlayerAuthState(steamId, stopActiveSession: true);
+
+            var player = FindPlayerBySteamId(steamId);
+            if (player != null && player.IsConnected)
+            {
+                SendCommandReply(player, replyMode, GetTokenShortLifetimeMessage(replyMode));
+            }
+        }
+
+        private static string GetTokenShortLifetimeMessage(CommandReplyMode replyMode)
+        {
+            return replyMode == CommandReplyMode.Console
+                ? "Crowd Control login expires in under 3 hours. Sign in again from the Crowd Control app, then run cc link."
+                : "Crowd Control login expires in under 3 hours. Re-auth in the app and run /cc link.";
         }
 
         private StoredSessionStatus GetStoredSessionStatus(string steamId, out PlayerSessionState session)
@@ -4856,6 +5207,15 @@ namespace Oxide.Plugins
             {
                 NotifyCrowdControlProvidersSessionStateChanged();
                 Puts($"Reload refresh completed for {refreshed} Crowd Control session(s).");
+            }
+
+            foreach (var kvp in _data.PlayerSessions)
+            {
+                if (IsSteamPlayerOnline(kvp.Key) &&
+                    IsSessionTokenUsable(kvp.Value))
+                {
+                    ScheduleTokenExpiryLogoutForPlayer(kvp.Key);
+                }
             }
         }
 
