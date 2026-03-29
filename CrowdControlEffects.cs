@@ -13,9 +13,9 @@ namespace Oxide.Plugins
     /// </summary>
     /// <remarks>
     /// Built-in rows are defined as <c>BuiltInEffectMeta</c> entries in <c>BuiltInEffectCatalog</c> (Built-in effect catalog region): effect id, display name,
-    /// description, default price, optional menu duration string, and optional timed Pub/Sub fallback seconds. <c>player_fire</c> uses a separate burn timed lifecycle.
+    /// description, default price, optional menu duration string (if omitted but <c>timedFallbackDurationSeconds</c> is set, menu duration is derived), optional timed Pub/Sub fallback seconds, and optional <c>worldEffect</c> (no per-player broadcast fan-out). <c>player_fire</c> uses a separate burn timed lifecycle.
     /// </remarks>
-    [Info("CrowdControlEffects", "Warp World", "1.0.3")]
+    [Info("CrowdControlEffects", "Warp World", "1.0.5")]
     [Description("Built-in Crowd Control Rust effect provider.")]
     public class CrowdControlEffects : RustPlugin
     {
@@ -138,7 +138,7 @@ namespace Oxide.Plugins
         #region Built-in effect catalog
 
         /// <summary>
-        /// One row in the static <c>BuiltInEffectCatalog</c> array. <see cref="MenuDurationValue"/> is the Crowd Control menu duration token (e.g. <c>0:0:15.0</c>).
+        /// One row in the static <c>BuiltInEffectCatalog</c> array. <see cref="MenuDurationValue"/> is the Crowd Control menu duration token (e.g. <c>0:0:15.0</c>) when you need an explicit string; if null and <see cref="TimedFallbackDurationSeconds"/> is set, registration uses seconds to build the menu token.
         /// <see cref="TimedFallbackDurationSeconds"/> when set selects timed Pub/Sub lifecycle and supplies seconds when the request has no parseable duration.
         /// </summary>
         private sealed class BuiltInEffectMeta
@@ -149,7 +149,8 @@ namespace Oxide.Plugins
                 string description,
                 int price,
                 string menuDurationValue = null,
-                int? timedFallbackDurationSeconds = null)
+                int? timedFallbackDurationSeconds = null,
+                bool worldEffect = false)
             {
                 EffectId = effectId ?? string.Empty;
                 DisplayName = displayName ?? string.Empty;
@@ -157,6 +158,7 @@ namespace Oxide.Plugins
                 Price = price;
                 MenuDurationValue = menuDurationValue;
                 TimedFallbackDurationSeconds = timedFallbackDurationSeconds;
+                WorldEffect = worldEffect;
             }
 
             public string EffectId { get; }
@@ -165,6 +167,10 @@ namespace Oxide.Plugins
             public int Price { get; }
             public string MenuDurationValue { get; }
             public int? TimedFallbackDurationSeconds { get; }
+            /// <summary>
+            /// Server/world-scoped effect (e.g. day/night): when <c>broadcast_effects_to_all_players</c> is on, do not fan out per player.
+            /// </summary>
+            public bool WorldEffect { get; }
         }
 
         private static BuiltInEffectMeta[] CreateBuiltInEffectCatalog()
@@ -180,10 +186,10 @@ namespace Oxide.Plugins
                 new BuiltInEffectMeta("give_armor_kit", "Give Armor Kit", "Give an armor clothing set.", 175),
                 new BuiltInEffectMeta("player_strip_armor", "Strip Armor", "Remove worn armor/clothing.", 150),
                 new BuiltInEffectMeta("player_break_armor", "Break Armor", "Destroy armor durability.", 175),
-                new BuiltInEffectMeta("world_set_day", "Set Day", "Set world time to day.", 150),
-                new BuiltInEffectMeta("world_set_night", "Set Night", "Set world time to night.", 150),
+                new BuiltInEffectMeta("world_set_day", "Set Day", "Set world time to day.", 150, worldEffect: true),
+                new BuiltInEffectMeta("world_set_night", "Set Night", "Set world time to night.", 150, worldEffect: true),
                 new BuiltInEffectMeta("player_hurt", "Player Hurt", "Deal light damage to the player.", 75),
-                new BuiltInEffectMeta("player_handcuff", "Handcuff Player", "Immobilize the player briefly.", 175, "0:0:12.0", 12),
+                new BuiltInEffectMeta("player_handcuff", "Handcuff Player", "Immobilize the player briefly.", 175, timedFallbackDurationSeconds: 12),
                 new BuiltInEffectMeta("player_fire", "Player Fire", "Set the player on fire briefly.", 225),
                 new BuiltInEffectMeta("player_heal", "Player Heal", "Heal a small amount.", 75),
                 new BuiltInEffectMeta("player_drop_item", "Player Drop Item", "Drop active inventory item.", 100),
@@ -246,8 +252,8 @@ namespace Oxide.Plugins
                 new BuiltInEffectMeta("player_fly_mode_15s", "Player Fly Mode (15s)", "Temporary fly mode for 15 seconds.", 250, "0:0:15.0"),
                 new BuiltInEffectMeta("player_admin_power_15s", "Player Admin Power (15s)", "Temporary god+fly for 15 seconds.", 400, "0:0:15.0"),
                 new BuiltInEffectMeta("player_revive", "Player Revive", "Revive player at last death location.", 250),
-                new BuiltInEffectMeta("player_damage_over_time", "Player Damage Over Time", "Apply timed damage-over-time.", 175, "0:0:15.0", 15),
-                new BuiltInEffectMeta("player_heal_over_time", "Player Heal Over Time", "Apply timed healing-over-time.", 175, "0:0:15.0", 15),
+                new BuiltInEffectMeta("player_damage_over_time", "Player Damage Over Time", "Apply timed damage-over-time.", 175, timedFallbackDurationSeconds: 15),
+                new BuiltInEffectMeta("player_heal_over_time", "Player Heal Over Time", "Apply timed healing-over-time.", 175, timedFallbackDurationSeconds: 15),
                 new BuiltInEffectMeta("spawn_testridablehorse", "Spawn Horse", "Spawn a ridable horse near player.", 175),
                 new BuiltInEffectMeta("spawn_boar", "Spawn Boar", "Spawn a boar near player.", 150),
                 new BuiltInEffectMeta("spawn_wolf", "Spawn Wolf", "Spawn a wolf near player.", 175),
@@ -340,6 +346,19 @@ namespace Oxide.Plugins
             return results;
         }
 
+        /// <summary>
+        /// Crowd Control menu duration token (hours:minutes:seconds) matching prior literals like <c>0:0:12.0</c>.
+        /// </summary>
+        private static string FormatMenuDurationValueFromSeconds(int totalSeconds)
+        {
+            if (totalSeconds <= 0)
+            {
+                return null;
+            }
+
+            return string.Format(System.Globalization.CultureInfo.InvariantCulture, "0:0:{0:0.0}", (double)totalSeconds);
+        }
+
         private void AppendBuiltInRegistration(JArray results, BuiltInEffectMeta meta)
         {
             if (results == null || meta == null)
@@ -356,11 +375,22 @@ namespace Oxide.Plugins
                 ["syncMenu"] = false
             };
 
-            if (!string.IsNullOrWhiteSpace(meta.MenuDurationValue))
+            if (meta.WorldEffect)
+            {
+                registerObj["worldEffect"] = true;
+            }
+
+            var menuDurationToken = meta.MenuDurationValue;
+            if (string.IsNullOrWhiteSpace(menuDurationToken) && meta.TimedFallbackDurationSeconds.HasValue)
+            {
+                menuDurationToken = FormatMenuDurationValueFromSeconds(meta.TimedFallbackDurationSeconds.Value);
+            }
+
+            if (!string.IsNullOrWhiteSpace(menuDurationToken))
             {
                 registerObj["duration"] = new JObject
                 {
-                    ["value"] = meta.MenuDurationValue
+                    ["value"] = menuDurationToken
                 };
             }
 
