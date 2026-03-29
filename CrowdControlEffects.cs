@@ -8,7 +8,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("CrowdControlEffects", "Warp World", "1.0.0")]
+    [Info("CrowdControlEffects", "Warp World", "1.0.1")]
     [Description("Built-in Crowd Control Rust effect provider.")]
     public class CrowdControlEffects : RustPlugin
     {
@@ -21,6 +21,7 @@ namespace Oxide.Plugins
         private readonly Dictionary<string, Oxide.Plugins.Timer> _activeHandcuffTimers = new Dictionary<string, Oxide.Plugins.Timer>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, Oxide.Plugins.Timer> _activePowerModeTimers = new Dictionary<string, Oxide.Plugins.Timer>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, Oxide.Plugins.Timer> _activeBurnTimers = new Dictionary<string, Oxide.Plugins.Timer>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, string> _burnCrowdControlRequestBySteamId = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _godModeSteamIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _flyModeSteamIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, Vector3> _lastDeathPositionBySteamId = new Dictionary<string, Vector3>(StringComparer.OrdinalIgnoreCase);
@@ -305,6 +306,11 @@ namespace Oxide.Plugins
                 };
             }
 
+            if (string.Equals(effectId, "player_fire", StringComparison.OrdinalIgnoreCase))
+            {
+                return StartCrowdControlledBurnEffect(context);
+            }
+
             if (IsTimedEffect(effectId))
             {
                 return StartTimedEffect(context, effectId);
@@ -401,6 +407,57 @@ namespace Oxide.Plugins
             };
         }
 
+        private object StartCrowdControlledBurnEffect(JObject context)
+        {
+            if (CrowdControl == null)
+            {
+                return new JObject
+                {
+                    ["status"] = "failTemporary",
+                    ["reason"] = "CrowdControl base plugin is unavailable."
+                };
+            }
+
+            var requestId = context?.Value<string>("requestID") ?? string.Empty;
+            var steamId = context?.Value<string>("playerSteamID") ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(requestId) || string.IsNullOrWhiteSpace(steamId))
+            {
+                return new JObject
+                {
+                    ["status"] = "failTemporary",
+                    ["reason"] = "Burn effect is missing request or player information."
+                };
+            }
+
+            var player = FindPlayerBySteamId(steamId);
+            if (player == null || !player.IsConnected || player.IsDead())
+            {
+                return new JObject
+                {
+                    ["status"] = "failTemporary",
+                    ["reason"] = "Burn effect requires a living connected player."
+                };
+            }
+
+            var effectPayload = context?["effect"] as JObject;
+            var seconds = GetEffectAmount(effectPayload, 5);
+            if (!TrySetPlayerOnFire(player, seconds, out var startError, requestId))
+            {
+                return new JObject
+                {
+                    ["status"] = "failTemporary",
+                    ["reason"] = startError ?? "Failed to start burn effect."
+                };
+            }
+
+            var burnTicks = Mathf.Clamp(seconds, 2, 12);
+            return new JObject
+            {
+                ["status"] = "timedBegin",
+                ["timeRemainingMs"] = burnTicks * 1000L
+            };
+        }
+
         private void ApplyTimedEffectTick(TimedEffectState state)
         {
             if (state == null)
@@ -409,8 +466,12 @@ namespace Oxide.Plugins
             }
 
             var player = FindPlayerBySteamId(state.SteamId);
-            if (player == null || !player.IsConnected)
+            if (player == null || !player.IsConnected || player.IsDead())
             {
+                StopTimedEffect(
+                    state.RequestId,
+                    completeRequest: true,
+                    reason: "Effect target became unavailable.");
                 return;
             }
 
@@ -562,6 +623,7 @@ namespace Oxide.Plugins
                 timerHandle?.Destroy();
             }
             _activeBurnTimers.Clear();
+            _burnCrowdControlRequestBySteamId.Clear();
 
             _godModeSteamIds.Clear();
             _flyModeSteamIds.Clear();
@@ -716,7 +778,7 @@ namespace Oxide.Plugins
                 case "player_handcuff":
                     return TryHandcuffPlayer(player, GetEffectAmount(effectPayload, 12), out error);
                 case "player_fire":
-                    return TrySetPlayerOnFire(player, GetEffectAmount(effectPayload, 5), out error);
+                    return TrySetPlayerOnFire(player, GetEffectAmount(effectPayload, 5), out error, crowdControlRequestId: null);
                 case "player_heal":
                     return TryHealPlayer(player, 25f, out error);
                 case "player_drop_item":
@@ -1252,12 +1314,17 @@ namespace Oxide.Plugins
             }
         }
 
-        private bool TrySetPlayerOnFire(BasePlayer player, int seconds, out string error)
+        private bool TrySetPlayerOnFire(BasePlayer player, int seconds, out string error, string crowdControlRequestId = null)
         {
             error = string.Empty;
             var steamId = player.UserIDString;
             EndBurnEffect(steamId);
             TryIgnitePlayer(player, seconds);
+
+            if (!string.IsNullOrWhiteSpace(crowdControlRequestId))
+            {
+                _burnCrowdControlRequestBySteamId[steamId] = crowdControlRequestId;
+            }
 
             var remainingTicks = Mathf.Clamp(seconds, 2, 12);
             _activeBurnTimers[steamId] = timer.Every(1f, () =>
@@ -1288,6 +1355,15 @@ namespace Oxide.Plugins
             {
                 timerHandle?.Destroy();
                 _activeBurnTimers.Remove(steamId);
+            }
+
+            if (_burnCrowdControlRequestBySteamId.TryGetValue(steamId, out var ccRequestId))
+            {
+                _burnCrowdControlRequestBySteamId.Remove(steamId);
+                if (!string.IsNullOrWhiteSpace(ccRequestId) && CrowdControl != null)
+                {
+                    CrowdControl.Call("CC_SendEffectResponse", ccRequestId, "timedEnd", string.Empty, string.Empty, null);
+                }
             }
         }
 
@@ -3275,25 +3351,65 @@ namespace Oxide.Plugins
 
         private int GetTimedEffectDurationSeconds(JObject effectPayload, string effectId)
         {
-            var durationSeconds = effectPayload?.Value<int?>("duration") ?? 0;
-            if (durationSeconds > 0)
+            var durationToken = effectPayload?["duration"];
+            if (durationToken != null && durationToken.Type != JTokenType.Null)
             {
-                return durationSeconds;
+                if (durationToken.Type == JTokenType.Integer || durationToken.Type == JTokenType.Float)
+                {
+                    try
+                    {
+                        var n = durationToken.ToObject<double>();
+                        if (n > 0d)
+                        {
+                            return Mathf.Max(1, Mathf.RoundToInt((float)n));
+                        }
+                    }
+                    catch
+                    {
+                        // fall through
+                    }
+                }
+
+                if (durationToken.Type == JTokenType.String &&
+                    double.TryParse(durationToken.Value<string>(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var parsedTop) &&
+                    parsedTop > 0d)
+                {
+                    return Mathf.Max(1, Mathf.RoundToInt((float)parsedTop));
+                }
             }
 
-            var durationToken = effectPayload?["duration"];
             if (durationToken is JObject durationObj)
             {
-                durationSeconds = durationObj.Value<int?>("seconds") ?? 0;
+                var durationSeconds = durationObj.Value<int?>("seconds") ?? 0;
                 if (durationSeconds > 0)
                 {
                     return durationSeconds;
                 }
 
-                var durationValue = durationObj.Value<string>("value");
-                if (!string.IsNullOrWhiteSpace(durationValue) && TimeSpan.TryParse(durationValue, out var parsedDuration))
+                var valueTok = durationObj["value"];
+                if (valueTok != null && valueTok.Type != JTokenType.Null)
                 {
-                    return Mathf.Max(1, Mathf.RoundToInt((float)parsedDuration.TotalSeconds));
+                    if (valueTok.Type == JTokenType.Integer || valueTok.Type == JTokenType.Float)
+                    {
+                        try
+                        {
+                            var n = valueTok.ToObject<double>();
+                            if (n > 0d)
+                            {
+                                return Mathf.Max(1, Mathf.RoundToInt((float)n));
+                            }
+                        }
+                        catch
+                        {
+                            // fall through
+                        }
+                    }
+
+                    var durationValue = valueTok.Type == JTokenType.String ? valueTok.Value<string>() : valueTok.ToString();
+                    if (!string.IsNullOrWhiteSpace(durationValue) && TimeSpan.TryParse(durationValue, out var parsedDuration))
+                    {
+                        return Mathf.Max(1, Mathf.RoundToInt((float)parsedDuration.TotalSeconds));
+                    }
                 }
             }
 
