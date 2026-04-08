@@ -18,7 +18,7 @@ namespace Oxide.Plugins
     /// <summary>
     /// Crowd Control integration for Rust: player linking, Pub/Sub WebSocket RPC, game sessions, retries, and a small public hook API (<c>CC_*</c>) for effect packs.
     /// </summary>
-    [Info("CrowdControl", "Warp World", "1.0.8")]
+    [Info("CrowdControl", "Warp World", "1.0.9")]
     [Description("Crowd Control integration for Rust with auth, PubSub, and permission-based access controls.")]
     public class CrowdControl : RustPlugin
     {
@@ -4392,6 +4392,7 @@ namespace Oxide.Plugins
                 case "spawn_attack_helicopter":
                 case "spawn_supply_drop":
                 case "spawn_horse":
+                case "spawn_testridablehorse":
                     return true;
                 default:
                     return normalized.StartsWith("spawn_", StringComparison.Ordinal);

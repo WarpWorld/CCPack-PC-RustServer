@@ -15,7 +15,7 @@ namespace Oxide.Plugins
     /// Built-in rows are defined as <c>BuiltInEffectMeta</c> entries in <c>BuiltInEffectCatalog</c> (Built-in effect catalog region): effect id, display name,
     /// description, default price, optional menu duration string (if omitted but <c>timedFallbackDurationSeconds</c> is set, menu duration is derived), optional timed Pub/Sub fallback seconds, and optional <c>worldEffect</c> (no per-player broadcast fan-out). <c>player_fire</c> uses a separate burn timed lifecycle.
     /// </remarks>
-    [Info("CrowdControlEffects", "Warp World", "1.0.6")]
+    [Info("CrowdControlEffects", "Warp World", "1.0.9")]
     [Description("Built-in Crowd Control Rust effect provider.")]
     public class CrowdControlEffects : RustPlugin
     {
@@ -28,14 +28,18 @@ namespace Oxide.Plugins
         private readonly Dictionary<string, TimedEffectState> _activeTimedEffects = new Dictionary<string, TimedEffectState>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, MovementFreezeState> _movementFreezeTimers = new Dictionary<string, MovementFreezeState>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, Oxide.Plugins.Timer> _activeHandcuffTimers = new Dictionary<string, Oxide.Plugins.Timer>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, bool> _handcuffPreviousRestrainedState = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, Oxide.Plugins.Timer> _activePowerModeTimers = new Dictionary<string, Oxide.Plugins.Timer>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, Oxide.Plugins.Timer> _activeBurnTimers = new Dictionary<string, Oxide.Plugins.Timer>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, string> _burnCrowdControlRequestBySteamId = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _godModeSteamIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _flyModeSteamIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _temporaryAdminSteamIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, Vector3> _lastDeathPositionBySteamId = new Dictionary<string, Vector3>(StringComparer.OrdinalIgnoreCase);
         private Oxide.Plugins.Timer _registerEffectsRetryTimer;
         private const bool VerboseLogging = true;
+        private const string AttackHelicopterPrefabPath = "assets/content/vehicles/attackhelicopter/attackhelicopter.entity.prefab";
+        private const string RidableHorsePrefabPath = "assets/content/vehicles/horse/ridablehorse2.prefab";
 
         private sealed class TimedEffectState
         {
@@ -48,8 +52,7 @@ namespace Oxide.Plugins
 
         private sealed class MovementFreezeState
         {
-            public Vector3 AnchorPosition;
-            public Oxide.Plugins.Timer EnforceTimer;
+            public bool WasRestrainedBefore;
             public Oxide.Plugins.Timer EndTimer;
         }
 
@@ -705,22 +708,22 @@ namespace Oxide.Plugins
 
         private void ClearAllGameplayState()
         {
-            foreach (var state in _movementFreezeTimers.Values)
+            foreach (var steamId in new List<string>(_movementFreezeTimers.Keys))
             {
-                state?.EnforceTimer?.Destroy();
-                state?.EndTimer?.Destroy();
+                ClearMovementFreeze(steamId);
             }
             _movementFreezeTimers.Clear();
 
-            foreach (var timerHandle in _activeHandcuffTimers.Values)
+            foreach (var steamId in new List<string>(_activeHandcuffTimers.Keys))
             {
-                timerHandle?.Destroy();
+                EndHandcuffEffect(steamId);
             }
             _activeHandcuffTimers.Clear();
+            _handcuffPreviousRestrainedState.Clear();
 
-            foreach (var timerHandle in _activePowerModeTimers.Values)
+            foreach (var steamId in new HashSet<string>(_activePowerModeTimers.Keys, StringComparer.OrdinalIgnoreCase))
             {
-                timerHandle?.Destroy();
+                EndTemporaryPowerMode(steamId, restoreFly: true, showUi: false);
             }
             _activePowerModeTimers.Clear();
 
@@ -733,6 +736,7 @@ namespace Oxide.Plugins
 
             _godModeSteamIds.Clear();
             _flyModeSteamIds.Clear();
+            _temporaryAdminSteamIds.Clear();
         }
 
         private void UpdateTeleportAvailability()
@@ -910,7 +914,7 @@ namespace Oxide.Plugins
                 case "spawn_supply_drop":
                     return TrySpawnSupplyDropAtPlayer(player, out error);
                 case "spawn_attack_helicopter":
-                    return TrySpawnByShortnameAtPlayer(player, "attackhelicopter.entity", 20f, 12f, "Attack helicopter spawned.", out error);
+                    return TrySpawnAttackHelicopterAtPlayer(player, out error);
                 case "spawn_nodes":
                     return TrySpawnOreNodes(player, "random", 4, out error);
                 case "spawn_nodes_stone":
@@ -1015,6 +1019,11 @@ namespace Oxide.Plugins
         private bool TryTeleportToCcPlayer(BasePlayer player, out string error)
         {
             error = string.Empty;
+            if (!CanSafelyTeleportPlayerNow(player, "teleport", out error))
+            {
+                return false;
+            }
+
             var candidates = GetActiveCcPlayers(player?.UserIDString);
             if (candidates.Count == 0)
             {
@@ -1023,14 +1032,28 @@ namespace Oxide.Plugins
             }
 
             var target = candidates[UnityEngine.Random.Range(0, candidates.Count)];
-            var destination = target.transform.position + new Vector3(0f, 0f, 1.5f);
-            player.Teleport(destination);
-            return true;
+            if (!CanSafelyTeleportPlayerNow(target, "teleport to this player", out error))
+            {
+                return false;
+            }
+
+            if (!TryResolveSafeTeleportDestination(target.transform.position, 1.4f, out var destination))
+            {
+                error = "Unable to find a safe teleport destination near the target player.";
+                return false;
+            }
+
+            return TryTeleportPlayerSafely(player, destination, out error);
         }
 
         private bool TrySwapTeleportWithCcPlayer(BasePlayer player, out string error)
         {
             error = string.Empty;
+            if (!CanSafelyTeleportPlayerNow(player, "swap players", out error))
+            {
+                return false;
+            }
+
             var candidates = GetActiveCcPlayers(player?.UserIDString);
             if (candidates.Count == 0)
             {
@@ -1039,17 +1062,51 @@ namespace Oxide.Plugins
             }
 
             var target = candidates[UnityEngine.Random.Range(0, candidates.Count)];
+            if (!CanSafelyTeleportPlayerNow(target, "swap with this player", out error))
+            {
+                return false;
+            }
+
             var sourcePos = player.transform.position;
             var targetPos = target.transform.position;
-            var verticalOffset = new Vector3(0f, 0.35f, 0f);
-            player.Teleport(targetPos + verticalOffset);
-            target.Teleport(sourcePos + verticalOffset);
-            return true;
+            if (!TryResolveSafeTeleportDestination(targetPos, 1.4f, out var playerDestination))
+            {
+                error = "Unable to find a safe swap destination near the target player.";
+                return false;
+            }
+
+            if (!TryResolveSafeTeleportDestination(sourcePos, 1.4f, out var targetDestination))
+            {
+                error = "Unable to find a safe swap destination for the other player.";
+                return false;
+            }
+
+            try
+            {
+                player.Teleport(playerDestination);
+                player.UpdateNetworkGroup();
+                player.SendNetworkUpdateImmediate();
+
+                target.Teleport(targetDestination);
+                target.UpdateNetworkGroup();
+                target.SendNetworkUpdateImmediate();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = $"Failed to complete swap teleport. {ex.Message}";
+                return false;
+            }
         }
 
         private bool TryTeleportToSleepingBag(BasePlayer player, out string error)
         {
             error = string.Empty;
+            if (!CanSafelyTeleportPlayerNow(player, "teleport to a sleeping bag", out error))
+            {
+                return false;
+            }
+
             var bags = GetPlayerSleepingBags(player);
             if (bags.Count == 0)
             {
@@ -1057,21 +1114,30 @@ namespace Oxide.Plugins
                 return false;
             }
 
-            var bag = bags[UnityEngine.Random.Range(0, bags.Count)];
-            if (bag == null || bag.IsDestroyed)
+            bags.Sort((left, right) =>
             {
-                error = "Selected sleeping bag is no longer valid.";
-                return false;
+                var leftDistance = left == null ? float.MaxValue : Vector3.SqrMagnitude(left.transform.position - player.transform.position);
+                var rightDistance = right == null ? float.MaxValue : Vector3.SqrMagnitude(right.transform.position - player.transform.position);
+                return leftDistance.CompareTo(rightDistance);
+            });
+
+            foreach (var bag in bags)
+            {
+                if (bag == null || bag.IsDestroyed)
+                {
+                    continue;
+                }
+
+                if (!TryResolveSafeTeleportDestination(bag.transform.position, 0.9f, out var destination))
+                {
+                    continue;
+                }
+
+                return TryTeleportPlayerSafely(player, destination, out error);
             }
 
-            var destination = bag.transform.position + new Vector3(0f, 0.2f, 0f);
-            if (Physics.Raycast(destination + Vector3.up * 2f, Vector3.down, out var hit, 6f))
-            {
-                destination.y = hit.point.y + 0.1f;
-            }
-
-            player.Teleport(destination);
-            return true;
+            error = "Unable to find a safe sleeping bag teleport destination.";
+            return false;
         }
 
         private List<SleepingBag> GetPlayerSleepingBags(BasePlayer player)
@@ -1141,42 +1207,48 @@ namespace Oxide.Plugins
             var steamId = player.UserIDString;
             if (_movementFreezeTimers.TryGetValue(steamId, out var existing))
             {
-                existing.EnforceTimer?.Destroy();
                 existing.EndTimer?.Destroy();
                 _movementFreezeTimers.Remove(steamId);
             }
 
             var freezeState = new MovementFreezeState
             {
-                AnchorPosition = player.transform.position
+                WasRestrainedBefore = IsPlayerRestrained(player)
             };
-
-            freezeState.EnforceTimer = timer.Every(0.1f, () =>
+            if (!freezeState.WasRestrainedBefore && !TrySetRestrainedStatus(player, true, out error))
             {
-                var current = FindPlayerBySteamId(steamId);
-                if (current != null && current.IsConnected)
-                {
-                    current.Teleport(freezeState.AnchorPosition);
-                }
-            });
-            freezeState.EndTimer = timer.Once(Mathf.Clamp(seconds, 1, 30), () => ClearMovementFreeze(player));
+                return false;
+            }
+
+            freezeState.EndTimer = timer.Once(Mathf.Clamp(seconds, 1, 30), () => ClearMovementFreeze(steamId));
             _movementFreezeTimers[steamId] = freezeState;
+            ShowEffectUi(player, "Crowd Control", $"Frozen for {Mathf.Clamp(seconds, 1, 30)}s.");
             return true;
         }
 
         private void ClearMovementFreeze(BasePlayer player)
         {
-            if (player == null)
+            ClearMovementFreeze(player?.UserIDString);
+        }
+
+        private void ClearMovementFreeze(string steamId)
+        {
+            if (string.IsNullOrWhiteSpace(steamId))
             {
                 return;
             }
 
-            var steamId = player.UserIDString;
             if (_movementFreezeTimers.TryGetValue(steamId, out var existing))
             {
-                existing.EnforceTimer?.Destroy();
                 existing.EndTimer?.Destroy();
                 _movementFreezeTimers.Remove(steamId);
+
+                var player = FindPlayerBySteamId(steamId);
+                if (player != null && player.IsConnected)
+                {
+                    var shouldRemainRestrained = existing.WasRestrainedBefore || _activeHandcuffTimers.ContainsKey(steamId);
+                    TrySetRestrainedStatus(player, shouldRemainRestrained, out _);
+                }
             }
         }
 
@@ -1188,12 +1260,17 @@ namespace Oxide.Plugins
         private bool TryHandcuffPlayer(BasePlayer player, int seconds, bool manageLifetime, out string error)
         {
             error = string.Empty;
+            var steamId = player.UserIDString;
+            if (!_handcuffPreviousRestrainedState.ContainsKey(steamId))
+            {
+                _handcuffPreviousRestrainedState[steamId] = IsPlayerRestrained(player);
+            }
+
             if (!TrySetRestrainedStatus(player, true, out error))
             {
                 return false;
             }
 
-            var steamId = player.UserIDString;
             if (_activeHandcuffTimers.TryGetValue(steamId, out var existing))
             {
                 existing?.Destroy();
@@ -1201,13 +1278,6 @@ namespace Oxide.Plugins
             }
 
             var duration = Mathf.Clamp(seconds, 3, 30);
-            if (!TryFreezeMovement(player, duration, out var freezeError))
-            {
-                TrySetRestrainedStatus(player, false, out _);
-                error = string.IsNullOrWhiteSpace(freezeError) ? "Unable to immobilize the player." : freezeError;
-                return false;
-            }
-
             if (manageLifetime)
             {
                 _activeHandcuffTimers[steamId] = timer.Once(duration, () => EndHandcuffEffect(steamId));
@@ -1228,11 +1298,18 @@ namespace Oxide.Plugins
             var player = FindPlayerBySteamId(steamId);
             if (player == null || !player.IsConnected)
             {
+                _handcuffPreviousRestrainedState.Remove(steamId);
                 return;
             }
 
-            TrySetRestrainedStatus(player, false, out _);
-            ClearMovementFreeze(player);
+            var shouldRemainRestrained = _movementFreezeTimers.ContainsKey(steamId);
+            if (_handcuffPreviousRestrainedState.TryGetValue(steamId, out var wasRestrainedBefore))
+            {
+                shouldRemainRestrained |= wasRestrainedBefore;
+                _handcuffPreviousRestrainedState.Remove(steamId);
+            }
+
+            TrySetRestrainedStatus(player, shouldRemainRestrained, out _);
         }
 
         private bool TrySetRestrainedStatus(BasePlayer player, bool restrained, out string error)
@@ -1483,6 +1560,7 @@ namespace Oxide.Plugins
 
             if (enableFly && !_flyModeSteamIds.Contains(steamId))
             {
+                EnsureTemporaryAdminPrivileges(player);
                 TryTogglePlayerNoClip(player);
                 _flyModeSteamIds.Add(steamId);
             }
@@ -1507,6 +1585,7 @@ namespace Oxide.Plugins
                 return;
             }
 
+            var grantedTemporaryAdmin = _temporaryAdminSteamIds.Remove(steamId);
             var player = FindPlayerBySteamId(steamId);
             if (player == null || !player.IsConnected)
             {
@@ -1516,6 +1595,20 @@ namespace Oxide.Plugins
             if (restoreFly && hadFly)
             {
                 TryTogglePlayerNoClip(player);
+            }
+
+            if (grantedTemporaryAdmin)
+            {
+                try
+                {
+                    player.SetPlayerFlag(BasePlayer.PlayerFlags.IsAdmin, false);
+                    player.UpdateNetworkGroup();
+                    player.SendNetworkUpdateImmediate();
+                }
+                catch (Exception ex)
+                {
+                    LogVerbose($"Failed restoring admin flag for {player.displayName}: {ex.Message}");
+                }
             }
 
             if (showUi)
@@ -1528,6 +1621,8 @@ namespace Oxide.Plugins
         {
             try
             {
+                player.UpdateNetworkGroup();
+                player.SendNetworkUpdateImmediate();
                 player.SendConsoleCommand("noclip");
             }
             catch (Exception ex)
@@ -2051,7 +2146,8 @@ namespace Oxide.Plugins
                 player.metabolism.SendChangesToClient();
             }
 
-            return TryFreezeMovement(player, 6, out error);
+            ShowEffectUi(player, "Crowd Control", "Fracture applied: damage and bleeding increased.");
+            return true;
         }
 
         private bool TryHealPlayer(BasePlayer player, float amount, out string error)
@@ -2101,9 +2197,7 @@ namespace Oxide.Plugins
             switch (spawnType)
             {
                 case "testridablehorse":
-                    forwardDistance = 10f;
-                    upOffset = 0.5f;
-                    break;
+                    return TrySpawnHorseAtPlayer(player, out error);
                 case "boar":
                 case "wolf":
                 case "chicken":
@@ -2406,6 +2500,74 @@ namespace Oxide.Plugins
             return true;
         }
 
+        private bool TrySpawnHorseAtPlayer(BasePlayer player, out string error)
+        {
+            error = string.Empty;
+            if (!TryResolveVehicleSpawnPosition(player, 10f, out var basePosition, out error))
+            {
+                return false;
+            }
+
+            var forward = player.eyes != null ? player.eyes.HeadForward() : player.transform.forward;
+            forward.y = 0f;
+            if (forward.sqrMagnitude < 0.001f)
+            {
+                forward = Vector3.forward;
+            }
+
+            return TrySpawnPrefabEntity(player, RidableHorsePrefabPath, basePosition + new Vector3(0f, 0.35f, 0f), Quaternion.LookRotation(forward.normalized, Vector3.up), "Horse spawned.", out error);
+        }
+
+        private bool TrySpawnAttackHelicopterAtPlayer(BasePlayer player, out string error)
+        {
+            error = string.Empty;
+            if (!TryResolveAttackHelicopterSpawnPosition(player, out var spawnPosition, out error))
+            {
+                return false;
+            }
+
+            var forward = player.eyes != null ? player.eyes.HeadForward() : player.transform.forward;
+            forward.y = 0f;
+            if (forward.sqrMagnitude < 0.001f)
+            {
+                forward = Vector3.forward;
+            }
+
+            return TrySpawnPrefabEntity(player, AttackHelicopterPrefabPath, spawnPosition, Quaternion.LookRotation(forward.normalized, Vector3.up), "Attack helicopter spawned.", out error);
+        }
+
+        private bool TrySpawnPrefabEntity(BasePlayer player, string prefabPath, Vector3 position, Quaternion rotation, string successMessage, out string error)
+        {
+            error = string.Empty;
+            BaseEntity entity;
+            try
+            {
+                entity = GameManager.server.CreateEntity(prefabPath, position, rotation, true);
+            }
+            catch (Exception ex)
+            {
+                error = $"Failed to spawn entity. {ex.Message}";
+                return false;
+            }
+
+            if (entity == null)
+            {
+                error = $"Failed to create prefab '{prefabPath}'.";
+                return false;
+            }
+
+            entity.OwnerID = player?.userID ?? 0uL;
+            entity.Spawn();
+            if (entity.IsDestroyed)
+            {
+                error = "Spawned entity was destroyed immediately.";
+                return false;
+            }
+
+            ShowEffectUi(player, "Crowd Control", successMessage);
+            return true;
+        }
+
         private string BuildSpawnSuccessMessage(string shortName)
         {
             if (string.IsNullOrWhiteSpace(shortName))
@@ -2695,7 +2857,7 @@ namespace Oxide.Plugins
         private bool TryResolveEnemySpawnPosition(BasePlayer player, Vector3 centerPosition, float minRadius, float maxRadius, float minSeparation, List<Vector3> occupiedPositions, out Vector3 spawnPosition)
         {
             spawnPosition = Vector3.zero;
-            for (var attempt = 0; attempt < 24; attempt++)
+            for (var attempt = 0; attempt < 40; attempt++)
             {
                 var angle = UnityEngine.Random.Range(0f, 360f);
                 var dir = Quaternion.Euler(0f, angle, 0f) * Vector3.forward;
@@ -2707,7 +2869,7 @@ namespace Oxide.Plugins
                 }
 
                 var candidate = new Vector3(probe.x, groundY, probe.z);
-                if (!Physics.Raycast(candidate + Vector3.up * 3f, Vector3.down, out var floorHit, 8f) || floorHit.normal.y < 0.55f)
+                if (!Physics.Raycast(candidate + Vector3.up * 4f, Vector3.down, out var floorHit, 12f) || floorHit.normal.y < 0.45f)
                 {
                     continue;
                 }
@@ -2720,6 +2882,35 @@ namespace Oxide.Plugins
 
                 spawnPosition = candidate;
                 return true;
+            }
+
+            var fallbackAngles = new[] { 0f, 30f, -30f, 60f, -60f, 90f, -90f, 120f, -120f, 150f, -150f, 180f };
+            for (var radius = Mathf.Max(0.5f, minRadius); radius <= Mathf.Max(minRadius + 0.1f, maxRadius); radius += 1.25f)
+            {
+                for (var i = 0; i < fallbackAngles.Length; i++)
+                {
+                    var dir = Quaternion.Euler(0f, fallbackAngles[i], 0f) * Vector3.forward;
+                    var probe = centerPosition + (dir * radius);
+                    if (!TryResolveSpawnGroundY(player, probe, out var groundY))
+                    {
+                        continue;
+                    }
+
+                    var candidate = new Vector3(probe.x, groundY, probe.z);
+                    if (!Physics.Raycast(candidate + Vector3.up * 4f, Vector3.down, out var floorHit, 12f) || floorHit.normal.y < 0.45f)
+                    {
+                        continue;
+                    }
+
+                    candidate.y = floorHit.point.y;
+                    if (IsEnemySpawnPositionCrowded(candidate, Mathf.Max(0.5f, minSeparation), occupiedPositions))
+                    {
+                        continue;
+                    }
+
+                    spawnPosition = candidate;
+                    return true;
+                }
             }
 
             return false;
@@ -2797,32 +2988,27 @@ namespace Oxide.Plugins
                 foreach (var lateralOffset in lateralOffsets)
                 {
                     var probe = anchor + (forward * forwardOffset) + (right * lateralOffset);
-                    if (!TryResolveSpawnGroundY(player, probe, out var groundY))
+                    if (!TryResolveGroundCandidate(player, probe, maxFromPlayer, forward, requireMostlyInFront: true, out var candidate))
                     {
                         continue;
                     }
 
-                    var candidate = new Vector3(probe.x, groundY, probe.z);
-                    if (!Physics.Raycast(candidate + Vector3.up * 3f, Vector3.down, out var floorHit, 8f) || floorHit.normal.y < 0.55f)
+                    spawnPosition = candidate;
+                    return true;
+                }
+            }
+
+            var fallbackAngleOffsets = new[] { 0f, 35f, -35f, 70f, -70f, 110f, -110f, 145f, -145f, 180f };
+            var fallbackRadii = new[] { Mathf.Clamp(preferredDistance, 4f, 10f), 4f, 6f, 8f, 10f, 12f };
+            foreach (var radius in fallbackRadii)
+            {
+                for (var i = 0; i < fallbackAngleOffsets.Length; i++)
+                {
+                    var direction = Quaternion.Euler(0f, fallbackAngleOffsets[i], 0f) * forward;
+                    var probe = player.transform.position + (direction * radius);
+                    if (!TryResolveGroundCandidate(player, probe, Mathf.Max(maxFromPlayer, 14f), forward, requireMostlyInFront: false, out var candidate))
                     {
                         continue;
-                    }
-
-                    candidate.y = floorHit.point.y;
-                    if (Vector3.Distance(player.transform.position, candidate) < 2f || Vector3.Distance(player.transform.position, candidate) > maxFromPlayer)
-                    {
-                        continue;
-                    }
-
-                    var toCandidate = candidate - player.transform.position;
-                    toCandidate.y = 0f;
-                    if (toCandidate.sqrMagnitude > 0.001f)
-                    {
-                        toCandidate.Normalize();
-                        if (Vector3.Dot(forward, toCandidate) < 0.15f)
-                        {
-                            continue;
-                        }
                     }
 
                     spawnPosition = candidate;
@@ -2832,6 +3018,44 @@ namespace Oxide.Plugins
 
             error = "Unable to spawn at current location. Try again.";
             return false;
+        }
+
+        private bool TryResolveGroundCandidate(BasePlayer player, Vector3 probe, float maxFromPlayer, Vector3 forward, bool requireMostlyInFront, out Vector3 candidate)
+        {
+            candidate = Vector3.zero;
+            if (!TryResolveSpawnGroundY(player, probe, out var groundY))
+            {
+                return false;
+            }
+
+            candidate = new Vector3(probe.x, groundY, probe.z);
+            if (!Physics.Raycast(candidate + Vector3.up * 4f, Vector3.down, out var floorHit, 12f) || floorHit.normal.y < 0.45f)
+            {
+                return false;
+            }
+
+            candidate.y = floorHit.point.y;
+            var distance = Vector3.Distance(player.transform.position, candidate);
+            if (distance < 1.5f || distance > maxFromPlayer)
+            {
+                return false;
+            }
+
+            if (requireMostlyInFront)
+            {
+                var toCandidate = candidate - player.transform.position;
+                toCandidate.y = 0f;
+                if (toCandidate.sqrMagnitude > 0.001f)
+                {
+                    toCandidate.Normalize();
+                    if (Vector3.Dot(forward, toCandidate) < 0.1f)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
         }
 
         private bool TryResolveVehicleSpawnPosition(BasePlayer player, float preferredDistance, out Vector3 spawnPosition, out string error)
@@ -2857,6 +3081,60 @@ namespace Oxide.Plugins
 
             spawnPosition = candidate;
             return true;
+        }
+
+        private bool TryResolveAttackHelicopterSpawnPosition(BasePlayer player, out Vector3 spawnPosition, out string error)
+        {
+            spawnPosition = Vector3.zero;
+            error = string.Empty;
+
+            var origin = player.transform.position;
+            var forward = player.eyes != null ? player.eyes.HeadForward() : player.transform.forward;
+            forward.y = 0f;
+            if (forward.sqrMagnitude < 0.001f)
+            {
+                forward = Vector3.forward;
+            }
+
+            forward.Normalize();
+            var angleOffsets = new[] { 0f, 20f, -20f, 45f, -45f, 75f, -75f, 110f, -110f, 150f, -150f, 180f };
+            var distances = new[] { 20f, 24f, 28f, 32f };
+            var heights = new[] { 18f, 24f, 30f, 36f };
+
+            foreach (var distance in distances)
+            {
+                for (var i = 0; i < angleOffsets.Length; i++)
+                {
+                    var direction = Quaternion.Euler(0f, angleOffsets[i], 0f) * forward;
+                    var probe = origin + (direction * distance);
+                    var groundY = origin.y;
+                    if (TryResolveSpawnGroundY(player, probe, out var resolvedGroundY))
+                    {
+                        groundY = resolvedGroundY;
+                    }
+
+                    var basePosition = new Vector3(probe.x, groundY, probe.z);
+                    if (IsNearStructure(basePosition, 6f))
+                    {
+                        continue;
+                    }
+
+                    foreach (var height in heights)
+                    {
+                        var candidate = basePosition + new Vector3(0f, height, 0f);
+                        if (HasBlockingCollider(candidate, 6f, allowSleepingBag: false))
+                        {
+                            continue;
+                        }
+
+                        spawnPosition = candidate;
+                        return true;
+                    }
+                }
+            }
+
+            error = "Unable to find clear airspace for the attack helicopter.";
+            return false;
         }
 
         private bool TryResolveWaterSpawnPosition(BasePlayer player, float preferredDistance, out Vector3 spawnPosition, out string error)
@@ -3143,17 +3421,26 @@ namespace Oxide.Plugins
             var playerY = playerPos.y;
             var terrainAtPlayer = TerrainMeta.HeightMap != null ? TerrainMeta.HeightMap.GetHeight(playerPos) : playerY;
             var isLikelyUnderground = playerY + 2f < terrainAtPlayer;
+            var highestReference = Mathf.Max(Mathf.Max(playerY, probe.y), terrainAtPlayer);
+            var rayDistance = Mathf.Max(24f, highestReference - Mathf.Min(playerY, probe.y) + 48f);
 
-            foreach (var origin in new[] { new Vector3(probe.x, playerY + 2.5f, probe.z), new Vector3(probe.x, playerY + 6f, probe.z) })
+            foreach (var origin in new[]
             {
-                if (Physics.Raycast(origin, Vector3.down, out var sameLevelHit, 18f) && sameLevelHit.normal.y >= 0.55f)
+                new Vector3(probe.x, Mathf.Max(playerY, probe.y) + 2.5f, probe.z),
+                new Vector3(probe.x, Mathf.Max(playerY, probe.y) + 6f, probe.z),
+                new Vector3(probe.x, highestReference + 4f, probe.z),
+                new Vector3(probe.x, highestReference + 12f, probe.z),
+                new Vector3(probe.x, terrainAtPlayer + 24f, probe.z)
+            })
+            {
+                if (Physics.Raycast(origin, Vector3.down, out var sameLevelHit, rayDistance) && sameLevelHit.normal.y >= 0.45f)
                 {
                     groundY = sameLevelHit.point.y;
                     return true;
                 }
             }
 
-            if (Physics.Raycast(new Vector3(probe.x, playerY + 30f, probe.z), Vector3.down, out var broadHit, 80f) && broadHit.normal.y >= 0.55f)
+            if (Physics.Raycast(new Vector3(probe.x, highestReference + 36f, probe.z), Vector3.down, out var broadHit, Mathf.Max(80f, rayDistance + 36f)) && broadHit.normal.y >= 0.45f)
             {
                 groundY = broadHit.point.y;
                 return true;
@@ -3166,6 +3453,190 @@ namespace Oxide.Plugins
             }
 
             return false;
+        }
+
+        private bool CanSafelyTeleportPlayerNow(BasePlayer player, string actionLabel, out string error)
+        {
+            error = string.Empty;
+            if (player == null || !player.IsConnected || player.IsDead())
+            {
+                error = "Player must be alive and connected.";
+                return false;
+            }
+
+            if (player.GetParentEntity() != null || IsPlayerMounted(player))
+            {
+                error = $"Cannot {actionLabel} while mounted, driving, or seated.";
+                return false;
+            }
+
+            if (IsPlayerInLikelyAirState(player) || !IsPlayerGrounded(player))
+            {
+                error = $"Cannot {actionLabel} while jumping, falling, swimming, or flying.";
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool TryResolveSafeTeleportDestination(Vector3 anchorPosition, float preferredRadius, out Vector3 destination)
+        {
+            destination = Vector3.zero;
+            var radii = new[] { Mathf.Max(0f, preferredRadius), preferredRadius + 0.6f, preferredRadius + 1.2f, 0f };
+            var directions = new[]
+            {
+                Vector3.forward,
+                Vector3.back,
+                Vector3.right,
+                Vector3.left,
+                (Vector3.forward + Vector3.right).normalized,
+                (Vector3.forward + Vector3.left).normalized,
+                (Vector3.back + Vector3.right).normalized,
+                (Vector3.back + Vector3.left).normalized
+            };
+
+            foreach (var radius in radii)
+            {
+                if (radius <= 0.05f)
+                {
+                    if (TryResolveTeleportCandidate(anchorPosition, out destination))
+                    {
+                        return true;
+                    }
+
+                    continue;
+                }
+
+                for (var i = 0; i < directions.Length; i++)
+                {
+                    if (TryResolveTeleportCandidate(anchorPosition + (directions[i] * radius), out destination))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private bool TryResolveTeleportCandidate(Vector3 probe, out Vector3 destination)
+        {
+            destination = Vector3.zero;
+            foreach (var startHeight in new[] { 2.5f, 5f, 9f, 15f, 24f })
+            {
+                if (!Physics.Raycast(probe + (Vector3.up * startHeight), Vector3.down, out var hit, startHeight + 18f) || hit.normal.y < 0.45f)
+                {
+                    continue;
+                }
+
+                var candidate = hit.point + new Vector3(0f, 0.15f, 0f);
+                if (HasBlockingCollider(candidate, 0.55f, allowSleepingBag: true))
+                {
+                    continue;
+                }
+
+                destination = candidate;
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool TryTeleportPlayerSafely(BasePlayer player, Vector3 destination, out string error)
+        {
+            error = string.Empty;
+            try
+            {
+                player.Teleport(destination);
+                player.UpdateNetworkGroup();
+                player.SendNetworkUpdateImmediate();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = $"Failed to teleport player. {ex.Message}";
+                return false;
+            }
+        }
+
+        private bool HasBlockingCollider(Vector3 position, float radius, bool allowSleepingBag)
+        {
+            foreach (var collider in Physics.OverlapCapsule(position + Vector3.up * 0.25f, position + Vector3.up * 1.45f, radius))
+            {
+                if (collider == null || collider.isTrigger || collider is TerrainCollider)
+                {
+                    continue;
+                }
+
+                var entity = collider.GetComponentInParent<BaseEntity>();
+                if (entity == null)
+                {
+                    return true;
+                }
+
+                if (entity is BasePlayer)
+                {
+                    continue;
+                }
+
+                if (allowSleepingBag && entity is SleepingBag)
+                {
+                    continue;
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool IsPlayerRestrained(BasePlayer player)
+        {
+            if (player == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                return player.HasPlayerFlag(BasePlayer.PlayerFlags.IsRestrained);
+            }
+            catch
+            {
+            }
+
+            if (TryGetBoolMember(player, "IsRestrained", out var restrained))
+            {
+                return restrained;
+            }
+
+            return false;
+        }
+
+        private void EnsureTemporaryAdminPrivileges(BasePlayer player)
+        {
+            if (player == null)
+            {
+                return;
+            }
+
+            var steamId = player.UserIDString;
+            if (_temporaryAdminSteamIds.Contains(steamId) || player.HasPlayerFlag(BasePlayer.PlayerFlags.IsAdmin))
+            {
+                return;
+            }
+
+            try
+            {
+                player.SetPlayerFlag(BasePlayer.PlayerFlags.IsAdmin, true);
+                player.UpdateNetworkGroup();
+                player.SendNetworkUpdateImmediate();
+                _temporaryAdminSteamIds.Add(steamId);
+            }
+            catch (Exception ex)
+            {
+                LogVerbose($"Failed granting temporary admin flag to {player.displayName}: {ex.Message}");
+            }
         }
 
         private bool TryRunHypeTrainTestEffect(BasePlayer player, JObject requestPayload, JObject effectPayload, out string error)
