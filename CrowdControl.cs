@@ -874,7 +874,7 @@ namespace Oxide.Plugins
             TryGetAuthenticatedSession(player.UserIDString, out var session, pruneInvalid: false);
             var isConnected = HasActiveGameSession(player.UserIDString, session);
             SendCommandReply(player, replyMode, $"Status: {(isConnected ? "Connected" : "Not connected")}");
-            SendCommandReply(player, replyMode, $"Version: {Version} (mod {ModVersion})");
+            SendCommandReply(player, replyMode, $"Version: {this.Version} (mod {ModVersion})");
             var mvc = _config?.ModVersionCheck;
             if (mvc != null && mvc.Enabled)
             {
@@ -3948,19 +3948,26 @@ namespace Oxide.Plugins
             return false;
         }
 
-        private static bool TryParseComparableVersion(string raw, out Version version)
+        private bool TryParseComparableVersion(string raw, out VersionNumber version)
         {
-            version = null;
             var normalized = NormalizeVersionToken(raw);
             if (string.IsNullOrEmpty(normalized))
             {
+                version = default;
                 return false;
             }
 
-            return Version.TryParse(normalized, out version);
+            if (System.Version.TryParse(normalized, out System.Version sysVer))
+            {
+                version = new VersionNumber(sysVer.Major, sysVer.Minor, sysVer.Build);
+                return true;
+            }
+
+            version = default;
+            return false;
         }
 
-        private static string NormalizeVersionToken(string raw)
+        private string NormalizeVersionToken(string raw)
         {
             if (string.IsNullOrWhiteSpace(raw))
             {
