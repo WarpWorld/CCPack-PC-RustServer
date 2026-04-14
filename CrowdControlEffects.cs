@@ -27,6 +27,7 @@ namespace Oxide.Plugins
         private const string ProviderName = "CrowdControlEffects";
         private readonly Dictionary<string, TimedEffectState> _activeTimedEffects = new Dictionary<string, TimedEffectState>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, MovementFreezeState> _movementFreezeTimers = new Dictionary<string, MovementFreezeState>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, MovementLockState> _movementLockStates = new Dictionary<string, MovementLockState>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, Oxide.Plugins.Timer> _activeHandcuffTimers = new Dictionary<string, Oxide.Plugins.Timer>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, bool> _handcuffPreviousRestrainedState = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, Oxide.Plugins.Timer> _activePowerModeTimers = new Dictionary<string, Oxide.Plugins.Timer>(StringComparer.OrdinalIgnoreCase);
@@ -38,8 +39,6 @@ namespace Oxide.Plugins
         private readonly Dictionary<string, Vector3> _lastDeathPositionBySteamId = new Dictionary<string, Vector3>(StringComparer.OrdinalIgnoreCase);
         private Oxide.Plugins.Timer _registerEffectsRetryTimer;
         private const bool VerboseLogging = true;
-        private const string AttackHelicopterPrefabPath = "assets/content/vehicles/attackhelicopter/attackhelicopter.entity.prefab";
-        private const string RidableHorsePrefabPath = "assets/content/vehicles/horse/ridablehorse2.prefab";
 
         private sealed class TimedEffectState
         {
@@ -54,6 +53,98 @@ namespace Oxide.Plugins
         {
             public bool WasRestrainedBefore;
             public Oxide.Plugins.Timer EndTimer;
+        }
+
+        private sealed class MovementLockState
+        {
+            public bool FreezeActive;
+            public bool HandcuffActive;
+            public Vector3 LockedPosition;
+            public Oxide.Plugins.Timer LockTimer;
+        }
+
+        private sealed class HostileAttackHeliController : MonoBehaviour
+        {
+            private const float RetargetIntervalSeconds = 5f;
+            private const float MaxHeliDistanceToTarget = 140f;
+
+            private CrowdControlEffects _plugin;
+            private ulong _targetUserId;
+            private PatrolHelicopter _helicopter;
+            private PatrolHelicopterAI _helicopterAi;
+
+            private void Awake()
+            {
+                _helicopter = GetComponent<PatrolHelicopter>();
+                _helicopterAi = GetComponent<PatrolHelicopterAI>();
+            }
+
+            public void Init(CrowdControlEffects plugin, BasePlayer targetPlayer)
+            {
+                _plugin = plugin;
+                _targetUserId = targetPlayer?.userID ?? 0uL;
+                RefreshTargeting();
+                InvokeRepeating(nameof(RefreshTargeting), RetargetIntervalSeconds, RetargetIntervalSeconds);
+            }
+
+            public bool CanTarget(BaseCombatEntity entity)
+            {
+                var player = entity as BasePlayer;
+                return player != null && player.userID == _targetUserId;
+            }
+
+            private void OnDestroy()
+            {
+                CancelInvoke(nameof(RefreshTargeting));
+            }
+
+            private void RefreshTargeting()
+            {
+                if (_plugin == null || _helicopter == null || _helicopterAi == null || _helicopter.IsDestroyed)
+                {
+                    CancelInvoke(nameof(RefreshTargeting));
+                    return;
+                }
+
+                var target = BasePlayer.FindByID(_targetUserId);
+                if (target == null || !target.IsConnected || target.IsDead())
+                {
+                    _helicopterAi.Retire();
+                    CancelInvoke(nameof(RefreshTargeting));
+                    return;
+                }
+
+                for (var i = _helicopterAi._targetList.Count - 1; i >= 0; i--)
+                {
+                    if (_helicopterAi._targetList[i]?.ply != target)
+                    {
+                        _helicopterAi._targetList.RemoveAt(i);
+                    }
+                }
+
+                if (_helicopterAi._targetList.Count == 0)
+                {
+                    _helicopterAi._targetList.Add(new PatrolHelicopterAI.targetinfo(target, target));
+                }
+
+                if (GetHorizontalDistance(_helicopter.transform.position, target.transform.position) > MaxHeliDistanceToTarget)
+                {
+                    _helicopterAi.ExitCurrentState();
+                    _helicopterAi.State_Move_Enter(BuildMoveDestination(target));
+                }
+            }
+
+            private static Vector3 BuildMoveDestination(BasePlayer target)
+            {
+                return target.transform.position + new Vector3(UnityEngine.Random.Range(10f, 50f), 20f, UnityEngine.Random.Range(10f, 50f));
+            }
+
+            private static float GetHorizontalDistance(Vector3 left, Vector3 right)
+            {
+                left.y = 0f;
+                right.y = 0f;
+                return Vector3.Distance(left, right);
+            }
         }
 
         #endregion
@@ -119,6 +210,21 @@ namespace Oxide.Plugins
             _lastDeathPositionBySteamId[player.UserIDString] = player.transform.position;
         }
 
+        private object OnHelicopterTarget(HelicopterTurret turret, BaseCombatEntity entity)
+        {
+            return RestrictCrowdControlAttackHeliTarget(turret?._heliAI, entity);
+        }
+
+        private object CanHelicopterTarget(PatrolHelicopterAI heliAi, BasePlayer player)
+        {
+            return RestrictCrowdControlAttackHeliTarget(heliAi, player);
+        }
+
+        private object CanHelicopterStrafeTarget(PatrolHelicopterAI heliAi, BasePlayer player)
+        {
+            return RestrictCrowdControlAttackHeliTarget(heliAi, player);
+        }
+
         private object OnEntityTakeDamage(BaseCombatEntity entity, HitInfo hitInfo)
         {
             var player = entity as BasePlayer;
@@ -134,6 +240,80 @@ namespace Oxide.Plugins
 
             hitInfo.damageTypes?.ScaleAll(0f);
             return null;
+        }
+
+        private object RestrictCrowdControlAttackHeliTarget(PatrolHelicopterAI heliAi, BaseCombatEntity entity)
+        {
+            var controller = heliAi?.helicopterBase?.GetComponent<HostileAttackHeliController>();
+            if (controller == null)
+            {
+                return null;
+            }
+
+            return controller.CanTarget(entity) ? null : (object)false;
+        }
+
+        private object CanLootPlayer(BasePlayer target, BasePlayer looter)
+        {
+            return IsPlayerHandcuffed(looter) ? (object)false : null;
+        }
+
+        private object CanLootEntity(BasePlayer player, StorageContainer container)
+        {
+            return IsPlayerHandcuffed(player) ? (object)false : null;
+        }
+
+        private object CanLootEntity(BasePlayer player, LootableCorpse container)
+        {
+            return IsPlayerHandcuffed(player) ? (object)false : null;
+        }
+
+        private object CanLootEntity(BasePlayer player, DroppedItemContainer container)
+        {
+            return IsPlayerHandcuffed(player) ? (object)false : null;
+        }
+
+        private object CanPickupEntity(BasePlayer player, BaseCombatEntity entity)
+        {
+            return IsPlayerHandcuffed(player) ? (object)false : null;
+        }
+
+        private object CanMountEntity(BasePlayer player, BaseMountable mount)
+        {
+            return IsPlayerHandcuffed(player) ? (object)false : null;
+        }
+
+        private object CanUnlock(BasePlayer player, BaseLock baseLock)
+        {
+            return IsPlayerHandcuffed(player) ? (object)false : null;
+        }
+
+        private object CanTeleport(BasePlayer player)
+        {
+            return IsPlayerHandcuffed(player) ? "You cannot teleport while handcuffed." : null;
+        }
+
+        private object canTeleport(BasePlayer player)
+        {
+            return CanTeleport(player);
+        }
+
+        private object CanGridTeleport(BasePlayer player)
+        {
+            return CanTeleport(player);
+        }
+
+        private bool IsPlayerHandcuffed(BasePlayer player)
+        {
+            return player != null && IsSteamIdHandcuffed(player.UserIDString);
+        }
+
+        private bool IsSteamIdHandcuffed(string steamId)
+        {
+            return !string.IsNullOrWhiteSpace(steamId) &&
+                _movementLockStates.TryGetValue(steamId, out var state) &&
+                state != null &&
+                state.HandcuffActive;
         }
 
         #endregion
@@ -236,7 +416,7 @@ namespace Oxide.Plugins
                 new BuiltInEffectMeta("give_airdrop_signal", "Give Airdrop Signal", "Give a supply signal.", 175),
                 new BuiltInEffectMeta("spawn_minicopter", "Spawn Minicopter", "Spawn a minicopter nearby.", 250),
                 new BuiltInEffectMeta("spawn_supply_drop", "Spawn Supply Drop", "Spawn a supply drop nearby.", 250),
-                new BuiltInEffectMeta("spawn_attack_helicopter", "Spawn Attack Helicopter", "Spawn an attack helicopter nearby.", 500),
+                new BuiltInEffectMeta("spawn_attack_helicopter", "Spawn Attack Helicopter", "Summon a hostile patrol helicopter that hunts the player.", 500),
                 new BuiltInEffectMeta("spawn_nodes", "Spawn Nodes", "Spawn random ore nodes around the player on safe ground.", 250),
                 new BuiltInEffectMeta("spawn_nodes_stone", "Spawn Stone Nodes", "Spawn stone ore nodes around the player on safe ground.", 250),
                 new BuiltInEffectMeta("spawn_nodes_metal", "Spawn Metal Nodes", "Spawn metal ore nodes around the player on safe ground.", 275),
@@ -249,7 +429,7 @@ namespace Oxide.Plugins
                 new BuiltInEffectMeta("player_reload_active_weapon", "Reload Active Weapon", "Reload the active weapon.", 100),
                 new BuiltInEffectMeta("player_drain_active_weapon_ammo", "Drain Active Weapon Ammo", "Drain ammo from active weapon.", 125),
                 new BuiltInEffectMeta("player_bleed", "Player Bleed", "Increase player bleeding.", 125),
-                new BuiltInEffectMeta("player_fracture", "Player Fracture", "Apply fracture-like penalty.", 150),
+                new BuiltInEffectMeta("player_fracture", "Cripple Player", "Apply a fracture-like penalty.", 150),
                 new BuiltInEffectMeta("player_freeze_short", "Player Freeze Short", "Freeze movement briefly.", 150),
                 new BuiltInEffectMeta("player_god_mode_15s", "Player God Mode (15s)", "Temporary god mode for 15 seconds.", 250, "0:0:15.0"),
                 new BuiltInEffectMeta("player_fly_mode_15s", "Player Fly Mode (15s)", "Temporary fly mode for 15 seconds.", 250, "0:0:15.0"),
@@ -714,6 +894,12 @@ namespace Oxide.Plugins
             }
             _movementFreezeTimers.Clear();
 
+            foreach (var lockState in _movementLockStates.Values)
+            {
+                lockState?.LockTimer?.Destroy();
+            }
+            _movementLockStates.Clear();
+
             foreach (var steamId in new List<string>(_activeHandcuffTimers.Keys))
             {
                 EndHandcuffEffect(steamId);
@@ -794,11 +980,6 @@ namespace Oxide.Plugins
             {
                 error = "This effect requires the player to be alive.";
                 return false;
-            }
-
-            if (IsGenericSpawnEffect(normalized))
-            {
-                return TryHandleGenericSpawnEffect(player, normalized, out error);
             }
 
             switch (normalized)
@@ -915,6 +1096,9 @@ namespace Oxide.Plugins
                     return TrySpawnSupplyDropAtPlayer(player, out error);
                 case "spawn_attack_helicopter":
                     return TrySpawnAttackHelicopterAtPlayer(player, out error);
+                case "spawn_horse":
+                case "spawn_testridablehorse":
+                    return TrySpawnHorseAtPlayer(player, out error);
                 case "spawn_nodes":
                     return TrySpawnOreNodes(player, "random", 4, out error);
                 case "spawn_nodes_stone":
@@ -937,6 +1121,7 @@ namespace Oxide.Plugins
                     return TryReloadActiveWeapon(player, out error);
                 case "player_bleed":
                     return TryBleedPlayer(player, GetEffectAmount(effectPayload, 20), out error);
+                case "player_cripple":
                 case "player_fracture":
                     return TryFracturePlayer(player, out error);
                 case "player_freeze_short":
@@ -949,6 +1134,11 @@ namespace Oxide.Plugins
                 case "player_revive":
                     return TryRevivePlayer(player, out error);
                 default:
+                    if (IsGenericSpawnEffect(normalized))
+                    {
+                        return TryHandleGenericSpawnEffect(player, normalized, out error);
+                    }
+
                     error = $"Unknown instant effectID '{effectId}'.";
                     return false;
             }
@@ -1215,11 +1405,8 @@ namespace Oxide.Plugins
             {
                 WasRestrainedBefore = IsPlayerRestrained(player)
             };
-            if (!freezeState.WasRestrainedBefore && !TrySetRestrainedStatus(player, true, out error))
-            {
-                return false;
-            }
 
+            BeginMovementLock(player, handcuffActive: false);
             freezeState.EndTimer = timer.Once(Mathf.Clamp(seconds, 1, 30), () => ClearMovementFreeze(steamId));
             _movementFreezeTimers[steamId] = freezeState;
             ShowEffectUi(player, "Crowd Control", $"Frozen for {Mathf.Clamp(seconds, 1, 30)}s.");
@@ -1242,14 +1429,9 @@ namespace Oxide.Plugins
             {
                 existing.EndTimer?.Destroy();
                 _movementFreezeTimers.Remove(steamId);
-
-                var player = FindPlayerBySteamId(steamId);
-                if (player != null && player.IsConnected)
-                {
-                    var shouldRemainRestrained = existing.WasRestrainedBefore || _activeHandcuffTimers.ContainsKey(steamId);
-                    TrySetRestrainedStatus(player, shouldRemainRestrained, out _);
-                }
             }
+
+            EndMovementLock(steamId, clearFreeze: true, clearHandcuff: false);
         }
 
         private bool TryHandcuffPlayer(BasePlayer player, int seconds, out string error)
@@ -1270,6 +1452,9 @@ namespace Oxide.Plugins
             {
                 return false;
             }
+
+            TryDropHotbarItem(player, out _);
+            BeginMovementLock(player, handcuffActive: true);
 
             if (_activeHandcuffTimers.TryGetValue(steamId, out var existing))
             {
@@ -1299,10 +1484,11 @@ namespace Oxide.Plugins
             if (player == null || !player.IsConnected)
             {
                 _handcuffPreviousRestrainedState.Remove(steamId);
+                EndMovementLock(steamId, clearFreeze: false, clearHandcuff: true);
                 return;
             }
 
-            var shouldRemainRestrained = _movementFreezeTimers.ContainsKey(steamId);
+            var shouldRemainRestrained = false;
             if (_handcuffPreviousRestrainedState.TryGetValue(steamId, out var wasRestrainedBefore))
             {
                 shouldRemainRestrained |= wasRestrainedBefore;
@@ -1310,6 +1496,119 @@ namespace Oxide.Plugins
             }
 
             TrySetRestrainedStatus(player, shouldRemainRestrained, out _);
+            EndMovementLock(steamId, clearFreeze: false, clearHandcuff: true);
+        }
+
+        private void BeginMovementLock(BasePlayer player, bool handcuffActive)
+        {
+            if (player == null)
+            {
+                return;
+            }
+
+            var steamId = player.UserIDString;
+            if (string.IsNullOrWhiteSpace(steamId))
+            {
+                return;
+            }
+
+            if (!_movementLockStates.TryGetValue(steamId, out var state))
+            {
+                state = new MovementLockState();
+                _movementLockStates[steamId] = state;
+            }
+
+            state.LockedPosition = player.transform.position;
+            if (handcuffActive)
+            {
+                state.HandcuffActive = true;
+            }
+            else
+            {
+                state.FreezeActive = true;
+            }
+
+            if (state.LockTimer == null || state.LockTimer.Destroyed)
+            {
+                state.LockTimer = timer.Every(0.1f, () => EnforceMovementLock(steamId));
+            }
+        }
+
+        private void EndMovementLock(string steamId, bool clearFreeze, bool clearHandcuff)
+        {
+            if (string.IsNullOrWhiteSpace(steamId) || !_movementLockStates.TryGetValue(steamId, out var state))
+            {
+                return;
+            }
+
+            if (clearFreeze)
+            {
+                state.FreezeActive = false;
+            }
+
+            if (clearHandcuff)
+            {
+                state.HandcuffActive = false;
+            }
+
+            if (state.FreezeActive || state.HandcuffActive)
+            {
+                _movementLockStates[steamId] = state;
+                return;
+            }
+
+            state.LockTimer?.Destroy();
+            _movementLockStates.Remove(steamId);
+        }
+
+        private void EnforceMovementLock(string steamId)
+        {
+            if (string.IsNullOrWhiteSpace(steamId) || !_movementLockStates.TryGetValue(steamId, out var state))
+            {
+                return;
+            }
+
+            if (!state.FreezeActive && !state.HandcuffActive)
+            {
+                state.LockTimer?.Destroy();
+                _movementLockStates.Remove(steamId);
+                return;
+            }
+
+            var player = FindPlayerBySteamId(steamId);
+            if (player == null || !player.IsConnected || player.IsDead())
+            {
+                state.LockTimer?.Destroy();
+                _movementLockStates.Remove(steamId);
+                return;
+            }
+
+            if (Vector3.Distance(player.transform.position, state.LockedPosition) <= 0.05f)
+            {
+                return;
+            }
+
+            TryPauseFlyHackDetection(player, 0.25f);
+            player.Teleport(state.LockedPosition);
+            player.UpdateNetworkGroup();
+            player.SendNetworkUpdateImmediate();
+        }
+
+        private void TryPauseFlyHackDetection(BasePlayer player, float seconds)
+        {
+            if (player == null || seconds <= 0f)
+            {
+                return;
+            }
+
+            try
+            {
+                var pauseMethod = player.GetType().GetMethod("PauseFlyHackDetection", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(float) }, null);
+                pauseMethod?.Invoke(player, new object[] { seconds });
+            }
+            catch
+            {
+            }
         }
 
         private bool TrySetRestrainedStatus(BasePlayer player, bool restrained, out string error)
@@ -2515,7 +2814,41 @@ namespace Oxide.Plugins
                 forward = Vector3.forward;
             }
 
-            return TrySpawnPrefabEntity(player, RidableHorsePrefabPath, basePosition + new Vector3(0f, 0.35f, 0f), Quaternion.LookRotation(forward.normalized, Vector3.up), "Horse spawned.", out error);
+            var rotation = Quaternion.LookRotation(forward.normalized, Vector3.up);
+            var position = basePosition + new Vector3(0f, 0.35f, 0f);
+            var prefabCandidates = new[]
+            {
+                "assets/content/vehicles/horse/ridablehorse.prefab",
+                "assets/content/vehicles/horse/ridablehorse2.prefab"
+            };
+
+            foreach (var prefabPath in prefabCandidates)
+            {
+                BaseEntity entity = null;
+                try
+                {
+                    entity = GameManager.server.CreateEntity(prefabPath, position, rotation, true);
+                }
+                catch (Exception ex)
+                {
+                    LogVerbose($"Horse prefab spawn threw for '{prefabPath}': {ex.Message}");
+                }
+
+                if (entity == null)
+                {
+                    continue;
+                }
+
+                entity.OwnerID = player.userID;
+                entity.Spawn();
+                if (!entity.IsDestroyed)
+                {
+                    ShowEffectUi(player, "Crowd Control", "Horse spawned.");
+                    return true;
+                }
+            }
+
+            return TrySpawnByShortnameAtPosition(player, "testridablehorse", basePosition, 0.35f, "Horse spawned.", 0, out error);
         }
 
         private bool TrySpawnAttackHelicopterAtPlayer(BasePlayer player, out string error)
@@ -2526,45 +2859,23 @@ namespace Oxide.Plugins
                 return false;
             }
 
-            var forward = player.eyes != null ? player.eyes.HeadForward() : player.transform.forward;
-            forward.y = 0f;
-            if (forward.sqrMagnitude < 0.001f)
+            var helicopter = GameManager.server.CreateEntity("assets/prefabs/npc/patrol helicopter/patrolhelicopter.prefab", spawnPosition, Quaternion.identity, true) as PatrolHelicopter;
+            if (helicopter == null)
             {
-                forward = Vector3.forward;
-            }
-
-            return TrySpawnPrefabEntity(player, AttackHelicopterPrefabPath, spawnPosition, Quaternion.LookRotation(forward.normalized, Vector3.up), "Attack helicopter spawned.", out error);
-        }
-
-        private bool TrySpawnPrefabEntity(BasePlayer player, string prefabPath, Vector3 position, Quaternion rotation, string successMessage, out string error)
-        {
-            error = string.Empty;
-            BaseEntity entity;
-            try
-            {
-                entity = GameManager.server.CreateEntity(prefabPath, position, rotation, true);
-            }
-            catch (Exception ex)
-            {
-                error = $"Failed to spawn entity. {ex.Message}";
+                error = "Failed to create patrol helicopter prefab.";
                 return false;
             }
 
-            if (entity == null)
+            helicopter.Spawn();
+            if (helicopter.IsDestroyed)
             {
-                error = $"Failed to create prefab '{prefabPath}'.";
+                error = "Spawned patrol helicopter was destroyed immediately.";
                 return false;
             }
 
-            entity.OwnerID = player?.userID ?? 0uL;
-            entity.Spawn();
-            if (entity.IsDestroyed)
-            {
-                error = "Spawned entity was destroyed immediately.";
-                return false;
-            }
-
-            ShowEffectUi(player, "Crowd Control", successMessage);
+            var controller = helicopter.gameObject.GetComponent<HostileAttackHeliController>() ?? helicopter.gameObject.AddComponent<HostileAttackHeliController>();
+            controller.Init(this, player);
+            ShowEffectUi(player, "Crowd Control", "A hostile attack helicopter is hunting you.");
             return true;
         }
 
