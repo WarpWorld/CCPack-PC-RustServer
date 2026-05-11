@@ -1854,8 +1854,9 @@ namespace Oxide.Plugins
             if (player.metabolism?.bleeding != null)
             {
                 player.metabolism.bleeding.value = 0f;
-                player.metabolism.SendChangesToClient();
             }
+
+            player.SendNetworkUpdateImmediate();
 
             if (enableFly && !_flyModeSteamIds.Contains(steamId))
             {
@@ -1970,7 +1971,7 @@ namespace Oxide.Plugins
 
             player.metabolism.calories.value = 0f;
             player.metabolism.hydration.value = 0f;
-            player.metabolism.SendChangesToClient();
+            player.SendNetworkUpdateImmediate();
             ShowEffectUi(player, "Crowd Control", "Hunger strike!");
             return true;
         }
@@ -1996,7 +1997,7 @@ namespace Oxide.Plugins
 
             player.metabolism.calories.value = caloriesFull;
             player.metabolism.hydration.value = hydrationFull;
-            player.metabolism.SendChangesToClient();
+            player.SendNetworkUpdateImmediate();
             ShowEffectUi(player, "Crowd Control", "FillHunger restored food/water.");
             return true;
         }
@@ -2014,8 +2015,8 @@ namespace Oxide.Plugins
             if (player.metabolism?.bleeding != null)
             {
                 player.metabolism.bleeding.value = 0f;
-                player.metabolism.SendChangesToClient();
             }
+
             player.SendNetworkUpdateImmediate();
             ShowEffectUi(player, "Crowd Control", "Full Heal restored your health.");
             return true;
@@ -2431,7 +2432,7 @@ namespace Oxide.Plugins
             }
 
             player.metabolism.bleeding.value = Mathf.Clamp(player.metabolism.bleeding.value + Mathf.Clamp(amount, 1, 100), 0f, 200f);
-            player.metabolism.SendChangesToClient();
+            player.SendNetworkUpdateImmediate();
             return true;
         }
 
@@ -2442,9 +2443,9 @@ namespace Oxide.Plugins
             if (player.metabolism?.bleeding != null)
             {
                 player.metabolism.bleeding.value = Mathf.Clamp(player.metabolism.bleeding.value + 10f, 0f, 200f);
-                player.metabolism.SendChangesToClient();
             }
 
+            player.SendNetworkUpdateImmediate();
             ShowEffectUi(player, "Crowd Control", "Fracture applied: damage and bleeding increased.");
             return true;
         }
