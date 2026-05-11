@@ -18,7 +18,11 @@ namespace Oxide.Plugins
     /// <summary>
     /// Crowd Control integration for Rust: player linking, Pub/Sub WebSocket RPC, game sessions, retries, and a small public hook API (<c>CC_*</c>) for effect packs.
     /// </summary>
-    [Info("CrowdControl", "Warp World", "1.0.9")]
+    /// 
+    /// 
+    private const string ModVersion = "1.1.0";
+
+    [Info("CrowdControl", "Warp World", ModVersion)]
     [Description("Crowd Control integration for Rust with auth, PubSub, and permission-based access controls.")]
     public class CrowdControl : RustPlugin
     {
@@ -32,7 +36,6 @@ namespace Oxide.Plugins
         /// </summary>
         private const string PermBroadcastExclude = "crowdcontrol.broadcast.exclude";
         /// <summary>Plugin mod semver (keep in sync with <c>[Info]</c> version). Must be &gt;= OpenAPI <c>meta.mod.version</c> when mod version check is enabled.</summary>
-        private const string ModVersion = "1.0.8";
         private const bool StopSessionOnDisconnect = true;
         private const int SocketKeepAliveMinutes = 5;
         private const bool StopSessionOnUnload = true;
@@ -129,7 +132,10 @@ namespace Oxide.Plugins
             [JsonProperty("enforce_crowd_control")]
             public EnforceCrowdControlConfig EnforceCrowdControl { get; set; } = new EnforceCrowdControlConfig();
 
-            [JsonProperty("mod_version_check")]
+            /// <summary>
+            /// Mod version gate options are fixed in plugin source (not read from or written to CrowdControl.json).
+            /// </summary>
+            [JsonIgnore]
             public ModVersionCheckConfig ModVersionCheck { get; set; } = new ModVersionCheckConfig();
         }
 
@@ -137,16 +143,16 @@ namespace Oxide.Plugins
         {
             /// <summary>
             /// When true, requires this plugin version (see <c>ModVersion</c> in source) to be &gt;= <c>meta.mod.version</c> from the packs JSON.
-            /// Default false: the public Minecraft packs entry uses a much higher mod version and would block Rust builds until a Rust pack is configured.
+            /// Default false.
             /// </summary>
             [JsonProperty("enabled")]
-            public bool Enabled { get; set; } = false;
+            public bool Enabled { get; set; } = true;
 
             [JsonProperty("packs_json_url")]
-            public string PacksJsonUrl { get; set; } = "https://openapi.crowdcontrol.live/games/Minecraft/packs";
+            public string PacksJsonUrl { get; set; } = "https://openapi.crowdcontrol.live/games/Rust/packs";
 
             [JsonProperty("game_pack_id")]
-            public string GamePackId { get; set; } = "Minecraft";
+            public string GamePackId { get; set; } = "RustServer";
 
             /// <summary>
             /// When true, Crowd Control is disabled if the packs URL cannot be fetched or parsed. When false, failures allow the plugin to run (with a warning).
@@ -234,7 +240,7 @@ namespace Oxide.Plugins
         private sealed class EnforceCrowdControlConfig
         {
             [JsonProperty("enabled")]
-            public bool Enabled { get; set; } = false;
+            public bool Enabled { get; set; } = true;
 
             [JsonProperty("enforce_time_seconds")]
             public int EnforceTimeSeconds { get; set; } = 120;
@@ -882,12 +888,12 @@ namespace Oxide.Plugins
                     player,
                     replyMode,
                     IsCrowdControlModOperational()
-                        ? "Mod version check: OK (enabled)."
-                        : $"Mod version check: BLOCKED — {GetModVersionFailureUserSummary()}");
+                        ? "Version check: OK."
+                        : $"Version check blocked: {GetModVersionFailureUserSummary()}");
             }
             else
             {
-                SendCommandReply(player, replyMode, "Mod version check: off (see mod_version_check.enabled in config).");
+                SendCommandReply(player, replyMode, "Version check: off (set in plugin source).");
             }
         }
 
@@ -923,7 +929,7 @@ namespace Oxide.Plugins
             SendCommandReplies(
                 player,
                 replyMode,
-                $"Mod version check: {(mvc.Enabled ? "enabled" : "disabled")}, url={mvc.PacksJsonUrl}, game_pack_id={mvc.GamePackId}, block_if_check_fails={mvc.BlockIfCheckFails}, operational={IsCrowdControlModOperational()}");
+                $"Version check: {(mvc.Enabled ? "on" : "off")}, pack list={mvc.PacksJsonUrl}, pack id={mvc.GamePackId}, strict on failure={mvc.BlockIfCheckFails}, operational={IsCrowdControlModOperational()}");
         }
 
         private void HandleReloadCommand(BasePlayer player, CommandReplyMode replyMode)
@@ -2656,7 +2662,7 @@ namespace Oxide.Plugins
 
             if (string.IsNullOrEmpty(steamId))
             {
-                PrintWarning("Received application-auth-code without any waiting player.");
+                PrintWarning("Crowd Control: auth code arrived but no player was waiting for it.");
                 return;
             }
 
@@ -2710,8 +2716,8 @@ namespace Oxide.Plugins
                 }
             }
 
-            var message = payload.Value<string>("message") ?? "Unknown Crowd Control auth error.";
-            PrintWarning($"Crowd Control auth code error: {message}");
+            var message = payload.Value<string>("message") ?? "Unknown error from Crowd Control.";
+            PrintWarning($"Crowd Control: auth code error - {message}");
 
             var player = !string.IsNullOrEmpty(steamId) ? FindPlayerBySteamId(steamId) : null;
             if (player != null)
@@ -2732,7 +2738,7 @@ namespace Oxide.Plugins
 
             if (!_authCodeToSteamId.TryGetValue(code, out var steamId))
             {
-                PrintWarning($"Auth code redeemed but no matching player mapping for code {code}.");
+                PrintWarning($"Crowd Control: auth code was redeemed but this server had no matching pending link (code {code}).");
                 return;
             }
 
@@ -2744,7 +2750,7 @@ namespace Oxide.Plugins
         {
             var success = payload["success"]?.ToString(Formatting.None) ?? "[]";
             var failure = payload["failure"]?.ToString(Formatting.None) ?? "[]";
-            Puts($"Subscription result success={success}, failure={failure}");
+            LogVerbose($"PubSub subscription result success={success}, failure={failure}");
         }
 
         private void HandleGameSessionStop(JObject payload)
@@ -2940,7 +2946,7 @@ namespace Oxide.Plugins
             {
                 if (!IsCrowdControlModOperational())
                 {
-                    PrintWarning($"Crowd Control token exchange skipped for {steamId}: mod version gate.");
+                    PrintWarning($"Crowd Control: token exchange blocked for {steamId} (plugin version requirement).");
                     var blockedPlayer = FindPlayerBySteamId(steamId);
                     if (blockedPlayer != null)
                     {
@@ -2964,14 +2970,14 @@ namespace Oxide.Plugins
                 var token = responseJson.Value<string>("token");
                 if (string.IsNullOrEmpty(token))
                 {
-                    PrintWarning("Token exchange succeeded but no token field was present.");
+                    PrintWarning("Crowd Control: token exchange response had no token field.");
                     return;
                 }
 
                 var decoded = DecodeJwt(token);
                 if (decoded == null || string.IsNullOrEmpty(decoded.CcUid))
                 {
-                    PrintWarning("Failed to decode Crowd Control JWT.");
+                    PrintWarning("Crowd Control: could not decode auth token (JWT).");
                     return;
                 }
                 LogVerbose(
@@ -3075,7 +3081,7 @@ namespace Oxide.Plugins
 
             if (!IsCrowdControlModOperational())
             {
-                LogVerbose("Skipping game-session start: mod version gate.");
+                LogVerbose("Skipping game session start: version check did not pass.");
                 return;
             }
 
@@ -3777,7 +3783,7 @@ namespace Oxide.Plugins
         private string GetModVersionFailureUserSummary()
         {
             return string.IsNullOrWhiteSpace(_modVersionFailureDetail)
-                ? "Crowd Control is disabled on this server (plugin version requirement). Ask the owner to update CrowdControl."
+                ? "Crowd Control is off on this server until the plugin is updated (version requirement)."
                 : _modVersionFailureDetail;
         }
 
@@ -3820,29 +3826,30 @@ namespace Oxide.Plugins
                 return;
             }
 
+            const string log = "Crowd Control: ";
             try
             {
                 var url = (cfg.PacksJsonUrl ?? string.Empty).Trim();
                 if (string.IsNullOrEmpty(url))
                 {
-                    SetModVersionGateFailed(!cfg.BlockIfCheckFails, "Mod version check enabled but packs_json_url is empty.");
-                    PrintError("Crowd Control mod_version_check.packs_json_url is empty.");
+                    SetModVersionGateFailed(!cfg.BlockIfCheckFails, "Version check failed: pack list URL is not set.");
+                    PrintError($"{log}Version check is on but the pack list URL is empty.");
                     return;
                 }
 
                 var packId = (cfg.GamePackId ?? string.Empty).Trim();
                 if (string.IsNullOrEmpty(packId))
                 {
-                    SetModVersionGateFailed(!cfg.BlockIfCheckFails, "Mod version check enabled but game_pack_id is empty.");
-                    PrintError("Crowd Control mod_version_check.game_pack_id is empty.");
+                    SetModVersionGateFailed(!cfg.BlockIfCheckFails, "Version check failed: game pack id is not set.");
+                    PrintError($"{log}Version check is on but the game pack id is empty.");
                     return;
                 }
 
                 var body = await GetHttpStringAsync(url);
                 if (string.IsNullOrWhiteSpace(body))
                 {
-                    SetModVersionGateFailed(!cfg.BlockIfCheckFails, "Mod version check: empty response from packs URL.");
-                    PrintWarning("Crowd Control mod version check: empty HTTP response.");
+                    SetModVersionGateFailed(!cfg.BlockIfCheckFails, "Version check failed: pack list returned an empty response.");
+                    PrintWarning($"{log}Pack list URL returned an empty body.");
                     return;
                 }
 
@@ -3853,15 +3860,15 @@ namespace Oxide.Plugins
                 }
                 catch (Exception ex)
                 {
-                    SetModVersionGateFailed(!cfg.BlockIfCheckFails, $"Mod version check: invalid JSON ({ex.Message}).");
-                    PrintWarning($"Crowd Control mod version check: JSON parse failed: {ex.Message}");
+                    SetModVersionGateFailed(!cfg.BlockIfCheckFails, $"Version check failed: pack list is not valid JSON ({ex.Message}).");
+                    PrintWarning($"{log}Pack list is not valid JSON ({ex.Message}).");
                     return;
                 }
 
                 if (!(root is JArray arr))
                 {
-                    SetModVersionGateFailed(!cfg.BlockIfCheckFails, "Mod version check: packs URL did not return a JSON array.");
-                    PrintWarning("Crowd Control mod version check: expected JSON array from packs URL.");
+                    SetModVersionGateFailed(!cfg.BlockIfCheckFails, "Version check failed: pack list must be a JSON array.");
+                    PrintWarning($"{log}Pack list must be a JSON array.");
                     return;
                 }
 
@@ -3869,47 +3876,47 @@ namespace Oxide.Plugins
                 {
                     SetModVersionGateFailed(
                         !cfg.BlockIfCheckFails,
-                        $"Mod version check: no meta.mod.version for gamePackID '{packId}'.");
-                    PrintWarning($"Crowd Control mod version check: no entry or meta.mod.version for gamePackID '{packId}'.");
+                        $"Version check failed: no required mod version for pack '{packId}'.");
+                    PrintWarning($"{log}Pack list has no meta.mod.version entry for '{packId}'.");
                     return;
                 }
 
                 if (!TryParseComparableVersion(requiredRaw, out var requiredV))
                 {
-                    SetModVersionGateFailed(!cfg.BlockIfCheckFails, $"Mod version check: could not parse required version '{requiredRaw}'.");
-                    PrintWarning($"Crowd Control mod version check: unparsable required version '{requiredRaw}'.");
+                    SetModVersionGateFailed(!cfg.BlockIfCheckFails, $"Version check failed: could not parse required version '{requiredRaw}'.");
+                    PrintWarning($"{log}Required version string is not usable: '{requiredRaw}'.");
                     return;
                 }
 
                 if (!TryParseComparableVersion(ModVersion, out var localV))
                 {
-                    SetModVersionGateFailed(false, "Mod version check: this plugin ModVersion value is not a valid version.");
-                    PrintError("Crowd Control ModVersion constant is not a valid semver.");
+                    SetModVersionGateFailed(false, "Version check failed: this plugin's built-in version is not a valid version string.");
+                    PrintError($"{log}Built-in plugin version is not a valid version string.");
                     return;
                 }
 
                 if (localV >= requiredV)
                 {
                     ClearModVersionGateFailure();
-                    LogVerbose($"Mod version check passed: local {ModVersion} >= required {requiredRaw}.");
+                    LogVerbose($"{log}Version check OK ({ModVersion} >= {requiredRaw}).");
                     return;
                 }
 
                 var msg =
-                    $"Crowd Control plugin version {ModVersion} is below the required {requiredRaw} (OpenAPI packs / meta.mod.version). Update the CrowdControl plugin.";
+                    $"This Crowd Control plugin ({ModVersion}) is older than the required version ({requiredRaw}). Update the plugin.";
                 SetModVersionGateFailed(false, msg);
-                PrintError(msg);
+                PrintError($"{log}{msg}");
             }
             catch (Exception ex)
             {
-                SetModVersionGateFailed(!cfg.BlockIfCheckFails, $"Mod version check: request failed ({ex.Message}).");
+                SetModVersionGateFailed(!cfg.BlockIfCheckFails, $"Version check failed: could not fetch pack list ({ex.Message}).");
                 if (cfg.BlockIfCheckFails)
                 {
-                    PrintError($"Crowd Control mod version check failed (blocking): {ex.Message}");
+                    PrintError($"{log}Version check request failed (connections blocked): {ex.Message}");
                 }
                 else
                 {
-                    PrintWarning($"Crowd Control mod version check failed (allowing plugin): {ex.Message}");
+                    PrintWarning($"{log}Version check request failed; continuing without blocking: {ex.Message}");
                 }
             }
             finally
@@ -4046,7 +4053,7 @@ namespace Oxide.Plugins
             }
             if (string.IsNullOrEmpty(steamId))
             {
-                PrintWarning($"Could not map effect request {requestId} target ccUID={targetCcUid} to a SteamID.");
+                PrintWarning($"Crowd Control: effect request {requestId} target ccUID={targetCcUid} could not be mapped to a player.");
                 return;
             }
 
@@ -4067,7 +4074,7 @@ namespace Oxide.Plugins
                     return;
                 }
 
-                PrintWarning($"No active token for SteamID {steamId}; cannot answer effect request {requestId}.");
+                PrintWarning($"Crowd Control: no session token for {steamId}; cannot run effect request {requestId}.");
                 return;
             }
             responseToken = session.Token;
@@ -4077,7 +4084,7 @@ namespace Oxide.Plugins
                 ClearEffectRetryState(requestId);
                 FireAndForget(
                     SendEffectResponseAsync(responseToken, requestId, "failPermanent", GetModVersionFailureEffectReason()),
-                    "effect blocked mod version gate");
+                    "effect response: version check");
                 return;
             }
 
@@ -5656,11 +5663,6 @@ namespace Oxide.Plugins
                 _config.EnforceCrowdControl = new EnforceCrowdControlConfig();
             }
 
-            if (_config.ModVersionCheck == null)
-            {
-                _config.ModVersionCheck = new ModVersionCheckConfig();
-            }
-
             if (_config.RetryPolicy.Default == null)
             {
                 _config.RetryPolicy.Default = new RetrySourcePolicyConfig
@@ -5740,11 +5742,6 @@ namespace Oxide.Plugins
                 if (_config.EnforceCrowdControl == null)
                 {
                     _config.EnforceCrowdControl = new EnforceCrowdControlConfig();
-                }
-
-                if (_config.ModVersionCheck == null)
-                {
-                    _config.ModVersionCheck = new ModVersionCheckConfig();
                 }
             }
             catch (Exception ex)
