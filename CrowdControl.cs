@@ -21,7 +21,6 @@ namespace Oxide.Plugins
     /// 
     /// 
     private const string ModVersion = "1.1.0";
-
     [Info("CrowdControl", "Warp World", ModVersion)]
     [Description("Crowd Control integration for Rust with auth, PubSub, and permission-based access controls.")]
     public class CrowdControl : RustPlugin
@@ -3955,6 +3954,10 @@ namespace Oxide.Plugins
             return false;
         }
 
+        /// <summary>
+        /// Parses a version for gate comparison using only <b>major.minor.patch</b> (first three dotted components).
+        /// Extra segments from Crowd Control (e.g. <c>1.1.0.1</c>) are ignored so they do not affect the result.
+        /// </summary>
         private bool TryParseComparableVersion(string raw, out VersionNumber version)
         {
             var normalized = NormalizeVersionToken(raw);
@@ -3964,14 +3967,60 @@ namespace Oxide.Plugins
                 return false;
             }
 
-            if (System.Version.TryParse(normalized, out System.Version sysVer))
+            if (TryParseFirstThreeVersionComponents(normalized, out var major, out var minor, out var build))
             {
-                version = new VersionNumber(sysVer.Major, sysVer.Minor, sysVer.Build);
+                version = new VersionNumber(major, minor, build);
+                return true;
+            }
+
+            if (Version.TryParse(normalized, out var sysVer))
+            {
+                var b = sysVer.Build >= 0 ? sysVer.Build : 0;
+                version = new VersionNumber(sysVer.Major, sysVer.Minor, b);
                 return true;
             }
 
             version = default;
             return false;
+        }
+
+        /// <summary>
+        /// Reads up to the first three <c>.</c>-separated integer segments; any further segments are ignored.
+        /// </summary>
+        private static bool TryParseFirstThreeVersionComponents(string normalized, out int major, out int minor, out int build)
+        {
+            major = 0;
+            minor = 0;
+            build = 0;
+            var parts = normalized.Split('.');
+            if (parts.Length == 0)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < parts.Length && i < 3; i++)
+            {
+                var p = parts[i].Trim();
+                if (string.IsNullOrEmpty(p) || !int.TryParse(p, out var n) || n < 0)
+                {
+                    return false;
+                }
+
+                switch (i)
+                {
+                    case 0:
+                        major = n;
+                        break;
+                    case 1:
+                        minor = n;
+                        break;
+                    case 2:
+                        build = n;
+                        break;
+                }
+            }
+
+            return true;
         }
 
         private string NormalizeVersionToken(string raw)
