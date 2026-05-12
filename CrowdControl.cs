@@ -16,16 +16,24 @@ using UnityEngine;
 namespace Oxide.Plugins
 {
     /// <summary>
+    /// Single source for the plugin version string used by the <c>[Info]</c> attribute and the mod version gate.
+    /// </summary>
+    internal static class CrowdControlMetadata
+    {
+        public const string ModVersion = "1.1.1";
+    }
+
+    /// <summary>
     /// Crowd Control integration for Rust: player linking, Pub/Sub WebSocket RPC, game sessions, retries, and a small public hook API (<c>CC_*</c>) for effect packs.
     /// </summary>
-    /// 
-    /// 
-    private const string ModVersion = "1.1.0";
-    [Info("CrowdControl", "Warp World", ModVersion)]
+    [Info("CrowdControl", "Warp World", CrowdControlMetadata.ModVersion)]
     [Description("Crowd Control integration for Rust with auth, PubSub, and permission-based access controls.")]
     public class CrowdControl : RustPlugin
     {
         #region Constants and fields
+
+        /// <summary>Same as <see cref="CrowdControlMetadata.ModVersion"/>; must be &gt;= OpenAPI <c>meta.mod.version</c> when the version check is enabled.</summary>
+        private const string ModVersion = CrowdControlMetadata.ModVersion;
 
         private const string PermUse = "crowdcontrol.use";
         private const string PermAdmin = "crowdcontrol.admin";
@@ -34,7 +42,6 @@ namespace Oxide.Plugins
         /// Players with this permission are skipped when <c>broadcast_effects_to_all_players</c> fans out an effect to the server.
         /// </summary>
         private const string PermBroadcastExclude = "crowdcontrol.broadcast.exclude";
-        /// <summary>Plugin mod semver (keep in sync with <c>[Info]</c> version). Must be &gt;= OpenAPI <c>meta.mod.version</c> when mod version check is enabled.</summary>
         private const bool StopSessionOnDisconnect = true;
         private const int SocketKeepAliveMinutes = 5;
         private const bool StopSessionOnUnload = true;
@@ -3973,7 +3980,7 @@ namespace Oxide.Plugins
                 return true;
             }
 
-            if (Version.TryParse(normalized, out var sysVer))
+            if (System.Version.TryParse(normalized, out var sysVer))
             {
                 var b = sysVer.Build >= 0 ? sysVer.Build : 0;
                 version = new VersionNumber(sysVer.Major, sysVer.Minor, b);

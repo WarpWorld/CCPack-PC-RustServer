@@ -16,7 +16,7 @@ namespace Oxide.Plugins
     /// <c>CC_GetActiveCcPlayerSteamIds</c>, <c>CC_ReportEffectAvailability</c>, <c>CC_SendEffectResponse</c> (full signature with
     /// <c>timeRemainingMs</c> when not using <c>CC_CompleteEffect</c>).</para>
     /// </remarks>
-    [Info("CrowdControlRustExamples", "Warp World", "1.0.2")]
+    [Info("CrowdControlRustExamples", "Warp World", "1.1.1)]
     [Description("Example external Crowd Control provider: instant, async, timed, fail, and world-effect patterns.")]
     public class CrowdControlRustExamples : RustPlugin
     {

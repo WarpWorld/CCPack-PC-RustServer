@@ -15,7 +15,7 @@ namespace Oxide.Plugins
     /// Built-in rows are defined as <c>BuiltInEffectMeta</c> entries in <c>BuiltInEffectCatalog</c> (Built-in effect catalog region): effect id, display name,
     /// description, default price, optional menu duration string (if omitted but <c>timedFallbackDurationSeconds</c> is set, menu duration is derived), optional timed Pub/Sub fallback seconds, and optional <c>worldEffect</c> (no per-player broadcast fan-out). <c>player_fire</c> uses a separate burn timed lifecycle.
     /// </remarks>
-    [Info("CrowdControlEffects", "Warp World", "1.0.9")]
+    [Info("CrowdControlEffects", "Warp World", "1.1.1")]
     [Description("Built-in Crowd Control Rust effect provider.")]
     public class CrowdControlEffects : RustPlugin
     {
