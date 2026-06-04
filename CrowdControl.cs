@@ -673,7 +673,11 @@ namespace Oxide.Plugins
                 return;
             }
 
-            HandleCrowdControlCommand(player, arg.Args ?? Array.Empty<string>(), CommandReplyMode.Console);
+            var rawArgs = arg.Args;
+            var args = rawArgs == null || rawArgs.Length == 0
+                ? Array.Empty<string>()
+                : Array.ConvertAll(rawArgs, a => a.ToString());
+            HandleCrowdControlCommand(player, args, CommandReplyMode.Console);
         }
 
         private void HandleCrowdControlCommand(BasePlayer player, string[] args, CommandReplyMode replyMode)
