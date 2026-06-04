@@ -20,7 +20,7 @@ namespace Oxide.Plugins
     /// </summary>
     internal static class CrowdControlMetadata
     {
-        public const string ModVersion = "1.1.1";
+        public const string ModVersion = "1.1.2";
     }
 
     /// <summary>
