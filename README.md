@@ -1,5 +1,11 @@
 # Crowd Control Rust Server Guide
 
+## Pack metadata
+
+- **Game:** Rust
+- **Mod framework:** Oxide
+- **Configuration:** `oxide/config/CrowdControl.json`
+
 This document explains how the Rust Crowd Control server plugins are structured, how server admins should configure them, and how other plugin developers can attach their own effects to the base plugin.
 
 ## Plugin layout
